@@ -1,0 +1,33 @@
+###############################################################################
+module rate_limit
+version: "0.1.0"
+###############################################################################
+import core_logging.*
+
+const LIMIT_LLID = 100      # per 60 s
+const LIMIT_IP   = 300
+
+behavior check
+  inputs:
+    - llid : string
+    - ip   : string
+    - path : string
+  outputs:{ ok:bool, retry:int }
+  steps:
+    # key := rl:{scope}:{id}:{epoch-minute}
+    - let ts  = epoch(now()) // 60          # current minute bucket
+    - let k1  = concat("rl:uid:", llid, ":", ts)
+    - let k2  = concat("rl:ip:", ip  , ":", ts)
+
+    # atomically incr + set expire 65 s
+    - let c1  = redis.incr(k1)
+    - redis.expire(k1, 65)
+    - let c2  = redis.incr(k2)
+    - redis.expire(k2, 65)
+
+    - if c1 > LIMIT_LLID or c2 > LIMIT_IP {
+        • let retry = 60 - ((epoch(now())) % 60)
+        • core_logging.log(WARN,"rate-limit hit",{llid,ip,path})
+        • return { ok:false, retry }
+      }
+    - return { ok:true, retry:0 }

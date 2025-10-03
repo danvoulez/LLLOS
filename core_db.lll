@@ -1,0 +1,20 @@
+module core_db
+version: "0.1.0"
+
+datasource pg @main { url: env("PG_URL"), pool: 10 }
+
+behavior with_tx
+  inputs:
+    - body: code                       # bloco a executar
+  outputs: { result: any }
+  steps:
+    - pg.begin()
+    - try {
+        • let r = body()
+        • pg.commit()
+        • return { result: r }
+      } catch any e {
+        • pg.rollback()
+        • core_logging.log(ERROR, "db tx rollback", { error: e })
+        • raise e
+      }

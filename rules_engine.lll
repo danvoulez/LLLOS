@@ -1,0 +1,98 @@
+module rules_engine
+version: "0.1.0"
+
+import core_logging.*
+import core_error.*
+import engine_scheduler.{ enqueue_task }
+
+# ─────────── METAMODELO ───────────
+entity Rule
+  key: id (uuid)                          # uuid_v7()
+  properties:
+    - name: string
+    - expr: string                        # DSL condicional ex.: "amount > 1000 && country != 'PT'"
+    - action: string                      # ex.: "flag.fraud", "notify.ops"
+    - enabled: bool = true
+    - created_at: datetime = now()
+
+entity RuleRun
+  key: id (uuid)
+  properties:
+    - rule_id: uuid
+    - input: json
+    - matched: bool?
+    - action_result: json?
+    - started_at: datetime = now()
+    - ended_at: datetime?
+
+# ────────── PARSER & EVAL ──────────
+behavior parse_expr
+  inputs: { expr: string, ctx: json }
+  outputs: { result: bool }
+  steps:
+    # Mini-parser suportando &&, ||, !, comparações e acesso ctx.key
+    - return eval_bool(expr, ctx)         # builtin do runtime .lll
+
+behavior exec_action
+  inputs: { action: string, payload: json }
+  outputs: { result: json }
+  steps:
+    - match action {
+        case "flag.fraud"  ⇒ fraud_service.flag(payload)
+        case "notify.ops"  ⇒ notify_ops.send(payload)
+        case "enqueue.task"⇒ enqueue_task(payload.kind, payload, now())
+        case _             ⇒ core_error.raise_error(
+                                INTERNAL,
+                                concat("ação desconhecida ", action)
+                             )
+      }
+
+# ─────────── EXECUÇÃO INLINE ──────────
+behavior run_rule
+  inputs:
+    - rule: Rule
+    - input: json
+  outputs:
+    - matched: bool
+    - result: json?
+  steps:
+    - if !rule.enabled { return { matched:false } }
+    - let ok = parse_expr(rule.expr, input).result
+    - if !ok { return { matched:false } }
+    - let res = exec_action(rule.action, input).result
+    - return { matched:true, result:res }
+
+flow evaluate
+  inputs:
+    - rule_id: uuid
+    - input: json
+  outputs: { matched: bool }
+  steps:
+    - let r = fetch Rule[rule_id] ? core_error.raise_error(NOT_FOUND,"rule")
+    - let run = run_rule(r, input)
+    - insert RuleRun {
+        id: uuid_v7(), rule_id: r.id, input,
+        matched: run.matched, action_result: run.result, ended_at: now()
+      }
+    - return { matched: run.matched }
+
+# ─────────── AGENDADOR EM LOTE ──────────
+flow enqueue_batch_evaluate
+  inputs:
+    - kind: string                    # tag p/ source (ex.: "tx")
+    - inputs: list<json>
+  steps:
+    - for item in inputs :
+        • enqueue_task(
+            kind = "rules.batch",
+            payload = { input:item, kind }
+          )
+
+behavior run_batch_job
+  inputs: { payload: json }
+  steps:
+    - for r in query Rule[enabled = true] :
+        • run_rule(r, payload.input)
+
+# registra handler no engine
+engine_scheduler.run_task.register("rules.batch", run_batch_job)

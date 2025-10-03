@@ -1,0 +1,14 @@
+module core_ws
+version: "0.1.0"
+
+endpoint WS /ws
+  description: "Canal websocket genérico"
+  on_connect:
+    - core_logging.log(INFO, "WS client connected", { ip: client.ip })
+
+  on_message:
+    - core_logging.log(DEBUG, "WS inbound", { data: message })
+    - send(client, concat("echo:", message))
+
+  on_disconnect:
+    - core_logging.log(INFO, "WS client disconnected")

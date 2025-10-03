@@ -1,0 +1,120 @@
+###############################################################################
+module passkey_auth
+version: "0.1.0"
+###############################################################################
+import identity_auth_service.*
+import rbac.*
+import core_logging.*
+import redis_bus.*                      # armazenar challenges
+
+const RP_ID     = env("PASSKEY_RP", "voulezvous.app")
+const ORIGIN    = env("PASSKEY_ORIGIN", "https://voulezvous.app")
+const CHAL_TTL  = 300                  # s
+
+###############################################################################
+# 1.1  ENTIDADE
+###############################################################################
+entity WebAuthnCred
+  key: id (string)                     # credentialId (base64url)
+  properties:
+    - user_id: string                 # LLID
+    - public_key: string              # COSE_key (base64)
+    - sign_count: int = 0
+    - created_at: datetime = now()
+
+###############################################################################
+# 2 │ BEGIN REGISTER
+###############################################################################
+endpoint POST /auth/passkey/begin-register
+  request : { json { label:string } }      # rótulo p/ chave
+  responses: 200:{ challenge:string, rpId:string, user:{id,label}, pubKeyOpts:json }
+  handler:
+    - let uid = uuid_v7()
+    - let chal = base64url(random_bytes(32))
+    - redis.setex("chal:"+chal, CHAL_TTL, uid)       # store TEMP user id
+    - return {
+        challenge: chal,
+        rpId: RP_ID,
+        user:{ id: uid, label: body.label },
+        pubKeyOpts:{
+          pubKeyCredParams:[{alg:-7,type:"public-key"}],
+          authenticatorSelection:{ residentKey:"required", userVerification:"preferred" }
+        }
+      }
+
+###############################################################################
+# 3 │ FINISH REGISTER
+###############################################################################
+endpoint POST /auth/passkey/finish-register
+  request : json {
+      challenge:string,
+      credentialId:string,
+      publicKey:string,          # base64url(COSE)
+      clientDataJSON:string,
+      attestationObj:string
+  }
+  responses:201:{ llid:string, token:string }
+  handler:
+    - let uid = redis.get("chal:"+body.challenge)
+      ? raise_error(UNAUTHORIZED,"challenge vencido")
+    - redis.del("chal:"+body.challenge)
+
+    # cria LLID => PERSON
+    - let llid = create_identity(label="passkey", parent_id=null).id
+    - insert webauthncred {
+        id:body.credentialId,
+        user_id:llid,
+        public_key:body.publicKey
+      }
+    - bind_role(llid,"ADMIN","*")                # opcional: role base
+
+    - let jwt = issue_token(id=llid, ttl_minutes=60).token
+    - return 201 { llid, token:jwt }
+
+###############################################################################
+# 4 │ BEGIN LOGIN
+###############################################################################
+endpoint POST /auth/passkey/begin-login
+  request : { json { llid:string } }
+  responses:200:{ challenge:string, credentialIds:list<string>, rpId:string }
+  handler:
+    - let creds = query webauthncred[user_id=body.llid].id
+      ? raise_error(NOT_FOUND,"sem passkey")
+    - let chal = base64url(random_bytes(32))
+    - redis.setex("chal:"+chal, CHAL_TTL, body.llid)
+    - return { challenge:chal, credentialIds:creds, rpId:RP_ID }
+
+###############################################################################
+# 5 │ FINISH LOGIN
+###############################################################################
+endpoint POST /auth/passkey/finish-login
+  request : json {
+      challenge:string,
+      credentialId:string,
+      authenticatorData:string,
+      clientDataJSON:string,
+      signature:string
+  }
+  responses:200:{ token:string }
+  handler:
+    - let llid = redis.get("chal:"+body.challenge)
+      ? raise_error(UNAUTHORIZED)
+    - redis.del("chal:"+body.challenge)
+
+    - let cred = fetch webauthncred[id=body.credentialId]
+      ? raise_error(UNAUTHORIZED)
+    - ensure cred.user_id == llid ? raise_error(UNAUTHORIZED)
+
+    # verify signature (builtin helper)
+    - ensure webauthn_verify(
+        rpId=RP_ID, origin=ORIGIN,
+        publicKey=cred.public_key,
+        clientDataJSON=body.clientDataJSON,
+        authenticatorData=body.authenticatorData,
+        signature=body.signature,
+        prev_sign_count=cred.sign_count
+      ) ? raise_error(UNAUTHORIZED,"bad signature")
+
+    - update webauthncred[id=cred.id] { sign_count = sign_count + 1 }
+    - let jwt = issue_token(id=llid, ttl_minutes=60).token
+    - return { token:jwt }

@@ -1,0 +1,176 @@
+###############################################################################
+#  api_gateway.lll – HTTPS/2 + Idempotência + WS + Webhook                    #
+###############################################################################
+module api_gateway
+version: "1.0.0"
+
+###############################################################################
+# IMPORTS
+###############################################################################
+import rbac.*
+import core_logging.*
+import identity_auth_service.*
+import engine_scheduler.*
+import timeline_core.*
+
+###############################################################################
+# 1 │ ENTIDADES AUXILIARES
+###############################################################################
+entity RequestDedup
+  key: idem_key (string)                    # valor único do cabeçalho
+  properties:
+    - req_hash: string
+    - resp_json: json
+    - status: int
+    - created_at: datetime = now()
+
+entity OutboundWebhook
+  key: id (uuid)
+  properties:
+    - url: string
+    - payload: json
+    - attempts: int = 0
+    - max_attempts: int = 6
+    - next_try: datetime = now()
+    - delivered: bool = false
+    - last_status: int?
+
+###############################################################################
+# 2 │ MIDDLEWARE IDEMPOTÊNCIA
+###############################################################################
+behavior process_idempotent
+  inputs:
+    - idem_key: string
+    - req_hash: string
+    - handler: code              # bloco que devolve { status:int, body:json }
+  outputs:{ status:int, body:json }
+  steps:
+    # busca resposta salva
+    - let saved = fetch requestdedup[idem_key]
+    - if saved and saved.req_hash == req_hash {
+        • return { status:saved.status, body:saved.resp_json }
+      }
+    # executa handler real
+    - let resp = handler()
+    # persiste
+    - insert requestdedup {
+        idem_key, req_hash, resp_json:resp.body, status:resp.status
+      }
+    - return resp
+
+# limpeza tokens > 24h
+cron dedup_gc
+  every:"30 4 * * *"
+  steps:
+    - delete requestdedup[created_at < now() - interval '24 hours']
+
+###############################################################################
+# 3 │ AUTH + RBAC HELPERS
+###############################################################################
+behavior guard
+  inputs:
+    - perm: string
+  steps:
+    - let bearer = headers.Authorization ?? raise_error(UNAUTHORIZED)
+    - let llid   = parse_bearer(bearer)
+    - ensure rbac.check_access(llid, perm).allowed
+        ? raise_error(UNAUTHORIZED)
+    - return llid                               # devolve principal
+
+###############################################################################
+# 4 │ ENDPOINT REST EXEMPLO (TASK ENQUEUE) COM IDEMPOTÊNCIA
+###############################################################################
+endpoint POST /v2/tasks
+  description: "Enfileira tarefas — idempotente"
+  request : json { kind:string, payload:json }
+  headers : { Idempotency-Key?:string }
+  responses:
+    202 : { task_id:uuid }
+    400 : ApiError
+    401 : ApiError
+  handler:
+    - let idem = headers."Idempotency-Key" ?? uuid_v7()
+    - let hash = sha256(stringify(body))
+    - let llid = guard("tasks.enqueue")
+    - let resp = process_idempotent(
+        idem, hash,
+        () -> {
+          let id = enqueue_task(body.kind, body.payload).task_id
+          timeline_core.append_event("api",
+            { kind:"tasks.enqueue", caller:llid, id })
+          return { status:202, body:{ task_id:id } }
+        }
+      )
+    - return resp.status resp.body
+
+###############################################################################
+# 5 │ WEBSOCKET CANAL EVENTOS
+###############################################################################
+endpoint WS /v2/events
+  auth: guard("events.subscribe")             # chama guard; fecha se 401
+  on_connect:
+    - timeline_core.append_event("ws", {conn:client.ip})
+  on_message:
+    - send(client,"ping")                     # eco simples
+  push:
+    # qualquer evento timeline 'api' é transmitido
+    - for ev in timeline_core.query_stream("api",
+          since_lamport=state.last_lamport).events :
+        • send(client, stringify(ev))
+        • state.last_lamport = ev.lamport
+
+###############################################################################
+# 6 │ OUTBOUND WEBHOOK PROCESSOR
+###############################################################################
+flow queue_webhook
+  inputs:{ url:string, payload:json }
+  steps:
+    - insert outboundwebhook {
+        id:uuid_v7(), url, payload
+      }
+
+behavior deliver_webhook
+  inputs:{ webhook:OutboundWebhook }
+  steps:
+    - try {
+        • let r = http.post(webhook.url, json=webhook.payload, timeout="5s")
+        • if r.status >=200 && r.status<300 {
+            – update outboundwebhook[webhook.id] {
+                delivered=true, last_status:r.status
+              }
+            – return
+          }
+        • raise concat("http ",r.status)
+      } catch any e {
+        • let n = webhook.attempts + 1
+        • update outboundwebhook[webhook.id] {
+            attempts=n, last_status=500,
+            next_try=now()+duration(minutes=pow(2,n))
+          }
+        • if n >= webhook.max_attempts {
+            core_logging.log(ERROR,"webhook failed permanent",{id:webhook.id})
+          }
+      }
+
+cron webhook_dispatcher
+  every:"*/1 * * * *"
+  steps:
+    - for w in query outboundwebhook[
+        delivered=false, next_try <= now()]
+        limit 20 :
+        • deliver_webhook(w)
+
+###############################################################################
+# 7 │ CLI QUICK TEST
+###############################################################################
+endpoint CLI gw
+  subcommands:[enqueue]
+
+command gw enqueue
+  flags:{ --kind:string --payload:json }
+  action:
+    - let r = http.post("http://localhost:8080/v2/tasks",
+        headers={"Idempotency-Key":uuid_v7() },
+        json={kind:flags.kind,payload:flags.payload},
+        auth=env("JWT"))
+    - print(r.json)

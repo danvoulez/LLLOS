@@ -1,0 +1,78 @@
+###############################################################################
+module backup_runner
+version: "0.1.0"
+###############################################################################
+import core_logging.*
+import telemetry_core.*          # for metrics
+import core_db.*
+import event_bus.*               # to publish alert
+
+const BACKUP_DIR   = "/backups"
+const RETAIN_DAYS  = 14          # keep last 2 weeks
+const TEST_DB_NAME = "restore_probe"
+
+###############################################################################
+# 1 │ FLOW create_backup  (idempotent per date)
+###############################################################################
+flow create_backup
+  outputs:{ path:string }
+  steps:
+    - let fname = concat("vv-", format_date(now(),"yyyy-MM-dd"), ".dump")
+    - let path  = concat(BACKUP_DIR, "/", fname)
+    - if file.exists(path) { return { path } }               # already done
+    - file.pg_dump(env("PG_URL"), path, format="custom")     # -Fc
+    - telemetry_core.inc_counter("backup.ok")
+    - core_logging.log(INFO,"PG dump OK",{path})
+    - return { path }
+
+###############################################################################
+# 2 │ FLOW prune_old_backups
+###############################################################################
+flow prune_old_backups
+  steps:
+    - for f in file.list(BACKUP_DIR+"/*.dump") :
+        • if file.modified_at(f) < now()-duration(days=RETAIN_DAYS) {
+            file.delete(f)
+          }
+
+###############################################################################
+# 3 │ FLOW restore_probe  (weekly self-test)
+###############################################################################
+flow restore_probe
+  steps:
+    - let latest = file.last(BACKUP_DIR+"/*.dump")
+      ? raise_error(INTERNAL,"no backup")
+    - let url = regex_replace(env("PG_URL"), "/[^/]+$", "/"+TEST_DB_NAME)
+    - pg.exec("drop database if exists "+TEST_DB_NAME)
+    - pg.exec("create database "+TEST_DB_NAME)
+    - let ok = file.pg_restore(latest, url, clean=true, exit_on_error=true)
+    - try { pg.connect(url).exec("select 1") } catch any e {
+        telemetry_core.inc_counter("backup.rest_fail")
+        event_bus.publish("alert",{name:"RESTORE_FAIL",detail:e.message})
+        raise e
+      }
+    - telemetry_core.inc_counter("backup.rest_ok")
+    - pg.exec("drop database "+TEST_DB_NAME)
+    - core_logging.log(INFO,"restore probe OK",{dump:latest})
+
+###############################################################################
+# 4 │ Schedulers
+###############################################################################
+cron nightly_backup
+  every:"15 2 * * *"                # 02:15 UTC daily
+  steps:
+    - create_backup()
+    - prune_old_backups()
+
+cron weekly_probe
+  every:"30 3 * * 0"                # Sunday 03:30 UTC
+  steps:
+    - restore_probe()
+
+###############################################################################
+# 5 │ Alert consumers (publish → observer/dash already catch)
+###############################################################################
+event_bus.subscribe("alert",(a)->{
+  core_logging.log(ERROR,"ALERT "+a.name,a)
+  telemetry_core.inc_counter("alert."+a.name)
+})

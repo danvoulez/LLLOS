@@ -1,0 +1,27 @@
+###############################################################################
+module redis_bus
+version: "0.1.0"
+###############################################################################
+import core_logging.*
+
+# ─── publish:  XADD stream * payload_json ─────────────────────────────
+behavior publish
+  inputs:{ topic:string, payload:json }
+  steps:
+    - redis.xadd(topic, "*", { data:stringify(payload) })
+
+# ─── subscribe:  consumer-group on XREADGROUP ─────────────────────────
+behavior subscribe
+  inputs:
+    - topic   : string
+    - consumer: string = env("NODE_ID")     # unique per pod
+    - handler : code                        # handler(payload)
+  steps:
+    - try { redis.xgroup_create(topic,"g0","0", mkstream=true) } catch any {}
+    - loop {
+        let msgs = redis.xreadgroup("g0", consumer, streams={ (topic):">" }, count=100, block="5000")
+        for m in msgs {
+          handler(parse_json(m.data))
+          redis.xack(topic,"g0",m.id)
+        }
+      }

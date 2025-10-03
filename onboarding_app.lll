@@ -1,0 +1,121 @@
+###############################################################################
+module onboarding_app
+version: "0.1.0"
+###############################################################################
+import identity_auth_service.*
+import rbac.*
+import enforcement_policy.*
+import engine_scheduler.*
+import timeline_core.*
+import core_logging.*
+
+###############################################################################
+# 1 │ CONSTANTES
+###############################################################################
+const DEF_QUOTA_CALLS    = 1000
+const DEF_QUOTA_STORAGE  = 100  # MB
+
+###############################################################################
+# 2 │ FLOW principal
+###############################################################################
+flow onboard_app
+  inputs:
+    - app_name      : string
+    - owner_llid    : string               # LLID de quem solicita
+    - tenant        : string = "demo"
+    - pqc_app?      : bool   = true
+    - create_ro_key?: bool   = true
+    - webhook_url?  : string
+  outputs:
+    - app_id        : string
+    - api_key_rw    : string
+    - api_key_ro?   : string
+  steps:
+    ── 2.1 Criar identidade APP ─────────────────────────────────────────
+    - let app = create_identity(
+        scope=APP, label=app_name,
+        algo = pqc_app ? FALCON1024 : ED25519
+      )
+    - timeline_core.append_event("onb",{type:"app.create", id:app.id})
+
+    ── 2.2 Chave API read-write ────────────────────────────────────────
+    - let key_rw = create_identity(
+        scope=API_KEY, label=concat(app_name,"-rw"),
+        parent_id = app.id,
+        default_roles = {READ_WRITE}
+      )
+
+    ── 2.3 Chave API read-only (se pedido) ─────────────────────────────
+    - let key_ro = create_ro_key ?
+        create_identity(
+          scope=API_KEY, label=concat(app_name,"-ro"),
+          parent_id = app.id, default_roles = {READ_ONLY}
+        ).private_key : null
+
+    ── 2.4 RBAC  (função ADMIN exclusiva da app) ───────────────────────
+    - let role_name = concat("APP_ADMIN-", app_name)
+    - if !exists role[name=role_name] {
+        create_role(role_name, concat("Admin da app ",app_name))
+        grant_permission(role_name,"tasks.enqueue")
+        grant_permission(role_name,"events.subscribe")
+      }
+    - bind_role(owner_llid, role_name, tenant)
+
+    ── 2.5 Quotas padrão ───────────────────────────────────────────────
+    - if !exists quota_policy[tenant_id=tenant, scope=concat("calls.",app_name)]{
+        insert quota_policy {
+          id:uuid_v7(), tenant_id:tenant,
+          scope:concat("calls.",app_name),
+          limit:DEF_QUOTA_CALLS, period:"DAY"
+        }
+        insert quota_policy {
+          id:uuid_v7(), tenant_id:tenant,
+          scope:concat("storage.",app_name),
+          limit:DEF_QUOTA_STORAGE, period:"MONTH"
+        }
+      }
+
+    ── 2.6 Webhook opcional + health-ping ──────────────────────────────
+    - if webhook_url {
+        queue_webhook(webhook_url, { event:"onboard", app:app.id })
+        engine_scheduler.enqueue_task(
+          kind="webhook.health",
+          payload={ url:webhook_url, app:app.id },
+          run_at = now() + '5 minutes'
+        )
+      }
+
+    ── 2.7 Retorna credenciais ─────────────────────────────────────────
+    - return {
+        app_id:app.id,
+        api_key_rw:key_rw.private_key,
+        api_key_ro:key_ro
+      }
+
+###############################################################################
+# 3 │ CLI wrapper
+###############################################################################
+endpoint CLI app
+  subcommands:[onboard]
+
+command app onboard
+  flags:{
+    --name (-n):string  (required)
+    --owner(-o):string  (required)   # LLID dono
+    --tenant    :string="demo"
+    --no-ro-key :bool  = false
+    --webhook   :string?
+  }
+  action:
+    - let res = onboard_app(
+        app_name = flags.name,
+        owner_llid = flags.owner,
+        tenant = flags.tenant,
+        create_ro_key = !flags.no_ro_key,
+        webhook_url = flags.webhook
+      )
+    - table([{
+        APP_ID      : res.app_id,
+        API_KEY_RW  : res.api_key_rw,
+        API_KEY_RO  : res.api_key_ro ?? "n/a"
+      }])

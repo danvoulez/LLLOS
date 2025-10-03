@@ -1,0 +1,196 @@
+###############################################################################
+#  protocol_schema.lll – REST público v1                                     #
+###############################################################################
+module protocol_schema
+version: "1.0.0"
+
+# ─── IMPORTS DE BACKEND ───
+import identity_auth_service.*
+import engine_scheduler.*
+import rules_engine.*
+import timeline_core.*
+import enforcement_policy.*
+import core_error.*
+import core_logging.*
+
+###############################################################################
+# 0 ─── TIPOS GENÉRICOS / ERRORS
+###############################################################################
+enum ApiErrorCode
+  - UNAUTHORIZED
+  - NOT_FOUND
+  - QUOTA_EXCEEDED
+  - INVALID_INPUT
+  - INTERNAL
+
+message ApiError
+  field code    : ApiErrorCode
+  field message : string
+  field traceId : string?
+
+###############################################################################
+# 1 ─── IDENTITIES
+###############################################################################
+message CreateIdentityRequest
+  field scope  : string = "PERSON"
+  field label  : string
+  field pqc    : bool = false
+
+message CreateIdentityResponse
+  field id           : string
+  field private_key  : string
+
+endpoint POST /v1/identities
+  request  : CreateIdentityRequest
+  responses:
+    201 : CreateIdentityResponse
+    409 : ApiError
+  handler :
+    - let res = create_identity(
+        scope = parse_enum(IdentityScope, body.scope),
+        label = body.label,
+        algo  = body.pqc ? FALCON1024 : ED25519
+      )
+    - return 201 res
+
+message TokenRequest
+  field id    : string
+  field ttl   : int = 60
+  field roles : string = "READ_WRITE"
+
+endpoint POST /v1/tokens
+  request  : TokenRequest
+  responses:
+    201 : { token:string, expires_at:datetime }
+    400 : ApiError
+  handler :
+    - let tk = issue_token(
+        id = body.id,
+        ttl_minutes = body.ttl,
+        roles = set(map(split(body.roles,","), r->parse_enum(Role,trim(r))))
+      )
+    - return 201 tk
+
+###############################################################################
+# 2 ─── TASKS
+###############################################################################
+message EnqueueTaskRequest
+  field kind    : string
+  field payload : json = {}
+  field run_at? : datetime
+
+endpoint POST /v1/tasks
+  auth: verify_access(required_role=READ_WRITE)
+  request  : EnqueueTaskRequest
+  responses:
+    202 : { task_id:uuid }
+    429 : ApiError
+  handler:
+    - let id = enqueue_task(body.kind, body.payload, body.run_at ?? now()).task_id
+    - return 202 { task_id:id }
+
+endpoint GET /v1/tasks
+  query: { status?:string="PENDING", limit?:int=50 }
+  auth : verify_access(required_role=READ_ONLY)
+  responses:
+    200 : list<json>
+  handler:
+    - let rows = pg.exec(
+        "select id,kind,status,scheduled_at from task where status=$1 limit $2",
+        [ query.status, query.limit ]
+      )
+    - return rows
+
+###############################################################################
+# 3 ─── RULES
+###############################################################################
+endpoint GET /v1/rules
+  auth: verify_access(required_role=READ_ONLY)
+  responses: 200 : list<json>
+  handler:
+    - return query rule[]
+
+endpoint POST /v1/rules/{id}/test
+  path: { id:string }
+  request : { input:json }
+  auth    : verify_access(required_role=READ_ONLY)
+  responses:
+    200 : { matched:bool }
+  handler:
+    - let m = rules_engine.evaluate(path.id, body.input).matched
+    - return { matched:m }
+
+###############################################################################
+# 4 ─── QUOTA
+###############################################################################
+endpoint POST /v1/tenants/{tenant}/quota/{scope}/consume
+  path: { tenant:string, scope:string }
+  query: { amount?:int=1 }
+  auth : verify_access(required_role=READ_WRITE)
+  responses:
+    200 : { allowed:bool, remaining:int }
+    429 : ApiError
+  handler:
+    - let res = enforce_quota(path.tenant, path.scope, query.amount)
+    - if !res.allowed {
+        core_error.raise_error(QUOTA_EXCEEDED,"blocked")
+      }
+    - return { allowed:true, remaining:res.remaining }
+
+###############################################################################
+# 5 ─── TIMELINE
+###############################################################################
+endpoint GET /v1/timeline/{stream}
+  path: { stream:string }
+  query: { since_lamport?:int=0 }
+  auth : verify_access(required_role=READ_ONLY)
+  responses: 200 : list<json>
+  handler:
+    - return query_stream(path.stream, query.since_lamport).events
+
+###############################################################################
+# 6 ─── ERRO PADRÃO
+###############################################################################
+on_error any
+  steps:
+    - core_logging.log(ERROR,"api error",{path:req.path,err:err})
+    - return err.status ?? 500 ApiError{
+        code: map_err(err),
+        message: err.message,
+        traceId: req.id
+      }
+
+behavior map_err
+  inputs: { err:any }
+  outputs:{ code:ApiErrorCode }
+  steps:
+    - match err.kind {
+        case UNAUTHORIZED ⇒ return UNAUTHORIZED
+        case NOT_FOUND    ⇒ return NOT_FOUND
+        case DB_UNAVAILABLE⇒ return INTERNAL
+        case QUOTA_EXCEEDED⇒ return QUOTA_EXCEEDED
+        case VALIDATION   ⇒ return INVALID_INPUT
+        case _            ⇒ return INTERNAL
+      }
+
+###############################################################################
+# 7 ─── OPENAPI EXPORT
+###############################################################################
+exporter oas3
+  title: "VoulezVous Public API"
+  version: "1.0.0"
+  description: """
+  API REST sob contrato .lll.
+  Todas as rotas exigem Bearer token de LLID válido (Falcon-1024).
+  """
+  server: { url:"https://api.voulezvous.internal" }
+
+endpoint CLI protocol
+  subcommands:[export]
+
+command protocol export
+  flags:{ --path (-p):string="openapi.yaml" }
+  action:
+    - let spec = exporter.oas3.generate()
+    - file.write(flags.path, spec)
+    - print("OpenAPI escrito em", flags.path)

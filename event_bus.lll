@@ -1,0 +1,14 @@
+###############################################################################
+module event_bus
+version: "0.1.0"
+###############################################################################
+
+# publicar
+behavior publish
+  inputs:{ topic:string, payload:json }
+  steps: emit event bus_{topic} payload
+
+# assinar
+behavior subscribe
+  inputs:{ topic:string, handler:code }    # handler(payload)
+  steps: on_event bus_{topic} handler(event)

@@ -1,0 +1,32 @@
+###############################################################################
+module telemetry_api
+version: "0.1.0"
+###############################################################################
+import telemetry_core.*
+
+# ─────── PUSH (caso queira instrumentar via HTTP) ───────
+endpoint POST /metrics
+  request:{ json { key:string, val:float } }
+  handler:
+    - set_gauge(request.json.key, request.json.val)
+    - return { ok:true }
+
+# ─────── QUERY RAW ou ROLL-UP ───────
+endpoint GET /metrics
+  query:
+    - key    : string
+    - range  : string = "1h"      # 10m|1h|24h|7d
+  handler:
+    - let since = match params.range {
+        case "10m" ⇒ now()-interval'10 minutes'
+        case "1h"  ⇒ now()-interval'1 hour'
+        case "24h" ⇒ now()-interval'24 hours'
+        case "7d"  ⇒ now()-interval'7 days'
+      }
+    - let data = query metricpoint[key=params.key, ts>=since]
+    - if size(data)==0 {
+        • let data = query metricrollup[
+            key=params.key, bucket>=date_trunc("hour", since)
+          ]
+      }
+    - return { key:params.key, points:data }
