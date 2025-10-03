@@ -13,6 +13,48 @@ import enforcement_policy.*
 import timeline_core.*
 import federation_sync.*
 
+const WORKER_TICK_BATCH          = 15
+const QUOTA_RETENTION_DAYS       = 7
+const NDJSON_RETENTION_DAYS      = 30
+const TIMELINE_RETENTION_DAYS    = 90
+const HEALTH_RETRY_DELAY_MINUTES = 2
+
+###############################################################################
+# HELPERS
+###############################################################################
+
+behavior tick_workers
+  inputs:{ batch:int = WORKER_TICK_BATCH }
+  steps:
+    - engine_scheduler.worker_tick(batch)
+
+behavior prune_quota_windows
+  steps:
+    - delete quota_usage[
+        window_start < date_trunc("day", now() - duration(days = QUOTA_RETENTION_DAYS))
+      ]
+
+behavior ensure_pg_dump
+  outputs:{ path:string }
+  steps:
+    - let path = concat(
+        "/backups/pg-",
+        format_date(now(), "yyyy-MM-dd"),
+        ".dump"
+      )
+    - file.pg_dump(env("PG_URL"), path)
+    - return { path }
+
+behavior rotate_ndjson
+  steps:
+    - file.rotate("/var/lib/ndjson", keep = NDJSON_RETENTION_DAYS)
+
+behavior prune_timeline
+  steps:
+    - delete timeline_event[
+        created_at < now() - duration(days = TIMELINE_RETENTION_DAYS)
+      ]
+
 ###############################################################################
 # 1 ─── BOOTSTRAP CLUSTER
 ###############################################################################
@@ -30,11 +72,9 @@ cron real_time_tick
   every: "*/30 * * * * *"
   steps:
     # processa fila
-    - engine_scheduler.worker_tick(15)
+    - tick_workers()
     # faz mini-GC de quotas expiradas (próxima janela)
-    - delete quota_usage[
-        window_start < date_trunc("day", now() - interval '7 days')
-      ]
+    - prune_quota_windows()
 
 ###############################################################################
 # 3 ─── ROTINA DIÁRIA  (02:15 UTC)
@@ -43,19 +83,18 @@ cron daily_maintenance
   every: "15 2 * * *"
   steps:
     # backup PG (assumindo ext.file.pg_dump disponível)
-    - let path = concat(
-        "/backups/pg-", format_date(now(), "yyyy-MM-dd"), ".dump"
-      )
-    - file.pg_dump(env("PG_URL"), path)
-    - core_logging.log(INFO, "pg dump ok", { path })
+    - try {
+        let backup = ensure_pg_dump()
+        core_logging.log(INFO, "pg dump ok", { path: backup.path })
+      } catch any e {
+        core_logging.log(ERROR, "pg dump failed", { err: e.message })
+      }
 
     # rotaciona NDJSON
-    - file.rotate("/var/lib/ndjson", keep = 30)   # mantém 30 dias
+    - rotate_ndjson()
 
     # compacta timeline antigo
-    - delete timeline_event[
-        created_at < now() - interval '90 days'
-      ]
+    - prune_timeline()
     - core_logging.log(INFO, "daily maintenance done")
 
 ###############################################################################
@@ -80,7 +119,11 @@ behavior watchdog
         • core_logging.log(ERROR, "PG DOWN – restarting workers")
         • engine_scheduler.enqueue_task("sys.restart", {})
       }
-    - engine_scheduler.enqueue_task("sys.health.tick", {}, now() + '2 minutes')
+    - engine_scheduler.enqueue_task(
+        "sys.health.tick",
+        {},
+        now() + duration(minutes = HEALTH_RETRY_DELAY_MINUTES)
+      )
 
 engine_scheduler.run_task.register("sys.health.tick", watchdog)
 
