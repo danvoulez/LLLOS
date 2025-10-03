@@ -1,0 +1,34 @@
+###############################################################################
+module telemetry_dash
+version: "0.1.0"
+###############################################################################
+import telemetry_api.fetch_metrics
+
+component spark
+  props:{ pts:list<float> }
+  template:
+    <svg width="160" height="40" viewBox="0 0 {{size(props.pts)*4}} 40">
+      <polyline points="{{ join(map(enumerate(props.pts),
+          p->concat(p.index*4,',',40-(p.item))), ' ') }}"
+        fill="none" stroke="green" stroke-width="1"/>
+    </svg>
+
+endpoint GET /dash/mini
+  handler:
+    - let m = fetch_metrics()
+    - let html = """
+        <html><body>
+          <h3>Mini-dash</h3>
+          <table border=1 cellpadding=4>
+            <tr><th>key</th><th>value</th><th>spark 10m</th></tr>
+            {{ join(map(keys(m.gauges), k -> concat(
+              '<tr><td>',k,'</td><td>',m.gauges[k],'</td><td>',
+              spark({pts: map(query metricpoint[
+                                key=k, ts>=now()-interval'10 minutes'],
+                               p->p.val)}),
+              '</td></tr>'
+            )), '') }}
+          </table>
+          <meta http-equiv='refresh' content='15'>
+        </body></html>"""
+    - return html

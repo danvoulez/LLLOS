@@ -1,0 +1,141 @@
+###############################################################################
+#  observer_puro.lll  –  Telemetria & Alertas em puro .lll                    #
+###############################################################################
+module observer_puro
+version: "0.1.0"
+
+###############################################################################
+# IMPORTS
+###############################################################################
+import core_db.*
+import core_logging.*
+import timeline_core.*
+import engine_scheduler.*
+
+###############################################################################
+# 1 ─── ENTIDADES DE MÉTRICA
+###############################################################################
+entity MetricCounter
+  key: key (string)                      # ex.: "quota.blocked"
+  properties:
+    - value: int      = 0
+    - updated_at: datetime = now()
+
+entity MetricGauge
+  key: key (string)                      # ex.: "tasks.pending"
+  properties:
+    - value: float
+    - updated_at: datetime = now()
+
+entity Alert
+  key: id (uuid)
+  properties:
+    - name: string
+    - severity: string     # INFO | WARN | ERROR
+    - message: string
+    - created_at: datetime = now()
+    - resolved_at: datetime?
+
+###############################################################################
+# 2 ─── COLETORES (OBSERVADORES)
+###############################################################################
+# 2.1  listener de core_logging – conta erros/warns
+on_event log_entry
+  steps:
+    - if event.level in [WARN, ERROR] {
+        • upsert MetricCounter["log." + lower(event.level)] {
+            value = value + 1,
+            updated_at = now()
+          }
+      }
+
+# 2.2  listener de timeline – quota bloqueada, gdpr etc.
+on_event timeline.appended
+  steps:
+    - match event.stream {
+        case "quota" ⇒ if !event.payload.allowed {
+                          • upsert MetricCounter["quota.blocked"] {
+                              value = value + 1
+                            }
+                       }
+        case "gdpr"  ⇒ upsert MetricCounter["gdpr." + event.payload.status] {
+                          value = value + 1
+                       }
+      }
+
+###############################################################################
+# 3 ─── JOB DE REFRESH GAUGES (30 s)
+###############################################################################
+cron refresh_gauges
+  every: "*/30 * * * * *"
+  steps:
+    # tarefas pendentes
+    - let pending = count task[status='PENDING']
+    - upsert MetricGauge["tasks.pending"] { value = pending }
+
+    # atraso do slot lógico (timeline)
+    - let last = max timeline_event.lamport ?? 0
+    - upsert MetricGauge["timeline.lamport"] { value = last }
+
+###############################################################################
+# 4 ─── ALERTAS AUTOMÁTICOS
+###############################################################################
+cron alert_watch
+  every: "*/1 * * * *"
+  steps:
+    # alerta se tasks pendentes > 100
+    - let pend = fetch MetricGauge["tasks.pending"].value ?? 0
+    - if pend > 100 && !exists Alert[name="TASK_BACKLOG", resolved_at=null] {
+        • insert Alert {
+            id:uuid_v7(), name:"TASK_BACKLOG",
+            severity:"WARN",
+            message:concat("Fila com ", pend, " tarefas pendentes")
+          }
+        • core_logging.log(WARN,"TASK_BACKLOG alert raised")
+      }
+    - if pend <= 100 {
+        • update Alert[name="TASK_BACKLOG", resolved_at=null] {
+            resolved_at = now()
+          }
+      }
+
+###############################################################################
+# 5 ─── EXPORTAÇÃO PROMETHEUS
+###############################################################################
+exporter prometheus_metrics
+  gauges:
+    - tasks_pending :
+        collect: return fetch MetricGauge["tasks.pending"].value ?? 0
+    - quota_blocked_total :
+        collect: return fetch MetricCounter["quota.blocked"].value ?? 0
+    - log_warn_total :
+        collect: return fetch MetricCounter["log.warn"].value ?? 0
+    - log_error_total :
+        collect: return fetch MetricCounter["log.error"].value ?? 0
+
+###############################################################################
+# 6 ─── CLI UTIL
+###############################################################################
+endpoint CLI obs
+  description: "Observabilidade"
+  subcommands: [metrics, alerts]
+
+command obs metrics
+  flags: {}
+  action:
+    - let c = query metriccounter[]
+    - let g = query metricgauge[]
+    - table(concat(
+        map(c,x->{key:x.key,val:x.value}),
+        map(g,x->{key:x.key,val:x.value})
+      ))
+
+command obs alerts
+  flags: { --open : bool = false }
+  action:
+    - let lst = flags.open ? query alert[resolved_at=null]
+                           : query alert[]
+    - table(map(lst,a->{
+        id:a.id,name:a.name,sev:a.severity,msg:a.message,
+        created:a.created_at,resolved:a.resolved_at
+      }))

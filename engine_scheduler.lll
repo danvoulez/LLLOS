@@ -1,0 +1,142 @@
+module engine_scheduler
+version: "0.1.0"
+
+import core_db.*
+import core_logging.*
+import core_error.*
+
+# ─────────── ENTIDADES ───────────
+entity Task
+  key: id (uuid)                     # uuid_v7()
+  properties:
+    - kind: string                  # "email.send", "audit.rotate", etc.
+    - payload: json
+    - scheduled_at: timestamptz
+    - attempts: int = 0
+    - max_attempts: int = 5
+    - status: string = "PENDING"    # PENDING | RUNNING | DONE | ERROR
+    - last_error: string?
+    - created_at: timestamptz = now()
+    - updated_at: timestamptz = now()
+
+entity TaskAttempt
+  key: id (uuid)
+  properties:
+    - task_id: uuid
+    - started_at: timestamptz = now()
+    - ended_at: timestamptz?
+    - success: bool?
+    - error: string?
+
+# ────────── ENQUEUE & POLL ─────────
+flow enqueue_task
+  inputs:
+    - kind: string
+    - payload: json
+    - run_at?: timestamptz = now()
+    - max_attempts?: int = 5
+  outputs: { task_id: uuid }
+  steps:
+    - let id = uuid_v7()
+    - core_db.with_tx(() -> {
+        pg.exec(
+          "insert into task(id,kind,payload,scheduled_at,max_attempts) \
+           values ($1,$2,$3,$4,$5)",
+          [ id, kind, payload, run_at, max_attempts ]
+        )
+      })
+    - core_logging.log(INFO, "task enqueued", { id, kind, run_at })
+    - return { task_id: id }
+
+behavior poll_tasks
+  inputs:
+    - limit?: int = 10
+  outputs:
+    - tasks: list<Task>
+  steps:
+    - let rows = pg.exec(
+        "update task set status='RUNNING', updated_at=now() \
+         where id in (select id from task \
+                      where status='PENDING' \
+                        and scheduled_at <= now() \
+                      order by scheduled_at \
+                      for update skip locked \
+                      limit $1) \
+         returning *",
+        [ limit ]
+      )
+    - return { tasks: rows }
+
+# ─────────── EXEC & RETRY —─────────
+behavior complete_task
+  inputs:
+    - task_id: uuid
+    - success: bool
+    - error?: string
+  steps:
+    - core_db.with_tx(() -> {
+        pg.exec(
+          "update task set status=$2, last_error=$3, updated_at=now() \
+           where id=$1",
+          [ task_id, success ? "DONE" : "ERROR", error ]
+        )
+        pg.exec(
+          "update task_attempt set ended_at=now(), success=$2, error=$3 \
+           where task_id=$1 and ended_at is null",
+          [ task_id, success, error ]
+        )
+      })
+    - core_logging.log(
+        success ? INFO : ERROR,
+        "task finish",
+        { task_id, success, error }
+      )
+
+flow worker_tick
+  inputs:
+    - batch?: int = 5
+  steps:
+    - let res = poll_tasks(batch).tasks
+    - for t in res :
+        • core_db.with_tx(() -> {
+            pg.exec(
+              "insert into task_attempt(id,task_id) values ($1,$2)",
+              [ uuid_v7(), t.id ]
+            )
+          })
+        • try {
+            – run_task(t.kind, t.payload)      # defined below
+            – complete_task(t.id, true)
+          } catch any e {
+            – let attempts = t.attempts + 1
+            – let will_retry = attempts < t.max_attempts
+            – pg.exec(
+                "update task set attempts=$2, \
+                 scheduled_at = now() + interval '1 minute' * $3, \
+                 status='PENDING' \
+                 where id=$1",
+                [ t.id, attempts, attempts * attempts ]      # back-off²
+              )
+            – complete_task(t.id, false, stringify(e))
+            – if !will_retry {
+                core_logging.log(ERROR, "task exhausted", { id: t.id })
+              }
+          }
+
+behavior run_task           # stub – registre aqui handlers reais
+  inputs: { kind: string, payload: json }
+  steps:
+    - match kind {
+        case "email.send"        ⇒ email_service.send(payload)
+        case "audit.rotate"      ⇒ backfill_ndjson()
+        case _                   ⇒ core_error.raise_error(
+                                      INTERNAL,
+                                      concat("unknown kind ", kind)
+                                   )
+      }
+
+# ─────────── CRON DISPATCHER ──────────
+cron engine_tick
+  every: "*/30 * * * * *"        # a cada 30 s
+  steps:
+    - worker_tick(10)

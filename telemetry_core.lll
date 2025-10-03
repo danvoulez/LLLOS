@@ -1,0 +1,60 @@
+###############################################################################
+module telemetry_core
+version: "0.1.0"
+###############################################################################
+
+# ─────── ENTIDADE DE PONTO SÉRIE-TEMPORAL ───────
+entity MetricPoint
+  key: id (uuid)
+  properties:
+    - key: string            # ex.: tasks.pending
+    - ts:  datetime          # timestamp
+    - val: float
+    - created_at: datetime = now()
+
+# ─────── HELPERS DE INSTRUMENTAÇÃO ───────
+behavior inc_counter
+  inputs: { key:string, delta:int = 1 }
+  steps:
+    - insert metricpoint { id:uuid_v7(), key, ts:now(), val:delta }
+
+behavior set_gauge
+  inputs: { key:string, val:float }
+  steps:
+    - insert metricpoint { id:uuid_v7(), key, ts:now(), val }
+
+# ─────── ROLL-UP (minuto → hora → dia) ───────
+entity MetricRollup
+  key: (key, bucket)                     # bucket = 2025-10-07T14:00:00Z
+  properties:
+    - sum:  float = 0
+    - count:int   = 0
+    - max:  float = 0
+    - min:  float = 0
+    - updated_at: datetime = now()
+
+behavior rollup_batch
+  inputs: { since:datetime }
+  steps:
+    - for pt in query metricpoint[ts >= since] :
+        • let bucket = date_trunc("hour", pt.ts)
+        • upsert metricrollup[pt.key, bucket] {
+            sum   = sum + pt.val,
+            count = count + 1,
+            max   = max >? pt.val,
+            min   = min <? pt.val,
+            updated_at = now()
+          }
+
+cron rollup_hourly
+  every:"5 * * * *"      # 05min de cada hora
+  steps:
+    - let cutoff = now() - interval '65 minutes'
+    - rollup_batch(cutoff)
+
+# ─────── RETENÇÃO (mantém 7 dias em bruto) ───────
+cron retention_daily
+  every:"30 3 * * *"
+  steps:
+    - delete metricpoint[ts < now() - interval '7 days']
+    - delete metricrollup[bucket < now() - interval '90 days']

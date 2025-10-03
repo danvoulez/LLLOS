@@ -1,0 +1,121 @@
+###############################################################################
+module system_workflows
+version: "1.0.0"
+
+###############################################################################
+# IMPORTS
+###############################################################################
+import core_boot.*
+import core_logging.*
+import core_db.*
+import engine_scheduler.*
+import enforcement_policy.*
+import timeline_core.*
+import federation_sync.*
+
+###############################################################################
+# 1 ─── BOOTSTRAP CLUSTER
+###############################################################################
+flow bootstrap_cluster
+  description: "Inicializa serviços, migrations, cron e workers"
+  steps:
+    - core_boot.start_core()
+    - engine_scheduler.enqueue_task("sys.health.tick", {})    # arranca watchdog
+    - core_logging.log(INFO, "cluster bootstrapped")
+
+###############################################################################
+# 2 ─── TICK EM TEMPO-REAL (a cada 30 s)
+###############################################################################
+cron real_time_tick
+  every: "*/30 * * * * *"
+  steps:
+    # processa fila
+    - engine_scheduler.worker_tick(15)
+    # faz mini-GC de quotas expiradas (próxima janela)
+    - delete quota_usage[
+        window_start < date_trunc("day", now() - interval '7 days')
+      ]
+
+###############################################################################
+# 3 ─── ROTINA DIÁRIA  (02:15 UTC)
+###############################################################################
+cron daily_maintenance
+  every: "15 2 * * *"
+  steps:
+    # backup PG (assumindo ext.file.pg_dump disponível)
+    - let path = concat(
+        "/backups/pg-", format_date(now(), "yyyy-MM-dd"), ".dump"
+      )
+    - file.pg_dump(env("PG_URL"), path)
+    - core_logging.log(INFO, "pg dump ok", { path })
+
+    # rotaciona NDJSON
+    - file.rotate("/var/lib/ndjson", keep = 30)   # mantém 30 dias
+
+    # compacta timeline antigo
+    - delete timeline_event[
+        created_at < now() - interval '90 days'
+      ]
+    - core_logging.log(INFO, "daily maintenance done")
+
+###############################################################################
+# 4 ─── SYNC FEDERATIVO  (cada hora minuto 05)
+###############################################################################
+cron hourly_federation_sync
+  every: "5 * * * *"
+  steps:
+    - for rc in query remote_cluster[active=true] :
+        • engine_scheduler.enqueue_task(
+            kind = "fed.sync",
+            payload = { cluster_id: rc.id }
+          )
+
+###############################################################################
+# 5 ─── WATCHDOG DE SAÚDE  (task periódica)
+###############################################################################
+behavior watchdog
+  steps:
+    - let ok_pg = core_db.health_check().ok
+    - if !ok_pg {
+        • core_logging.log(ERROR, "PG DOWN – restarting workers")
+        • engine_scheduler.enqueue_task("sys.restart", {})
+      }
+    - engine_scheduler.enqueue_task("sys.health.tick", {}, now() + '2 minutes')
+
+engine_scheduler.run_task.register("sys.health.tick", watchdog)
+
+###############################################################################
+# 6 ─── RESTART SOFT  (caso watchdog detecte falha)
+###############################################################################
+behavior restart_soft
+  steps:
+    - core_logging.log(WARN, "soft restart initiated")
+    - core_boot.start_core()
+
+engine_scheduler.run_task.register("sys.restart", restart_soft)
+
+###############################################################################
+# 7 ─── EXPOSIÇÃO NO CLI
+###############################################################################
+endpoint CLI sys
+  description: "Workflows globais"
+  subcommands:
+    - start   → sys_start
+    - status  → sys_status
+
+command sys_start
+  flags: {}
+  action:
+    - bootstrap_cluster()
+    - print("cluster started 🎉")
+
+command sys_status
+  flags: {}
+  action:
+    - let pending = count task[status='PENDING']
+    - let pg_ok = core_db.health_check().ok
+    - table([{
+        "PG": pg_ok ? "UP" : "DOWN",
+        "tasks_pending": pending,
+        "last_backup":  file.last("/backups/*.dump") ?? "n/a"
+      }])

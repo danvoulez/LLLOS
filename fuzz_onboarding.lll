@@ -1,0 +1,84 @@
+###############################################################################
+module fuzz_onboarding
+version: "0.1.0"
+###############################################################################
+import onboarding_app.*
+import onboarding_flows.*
+import api_gateway.*
+import identity_auth_service.*
+
+###############################################################################
+# helper: LLID random
+behavior new_llid
+  outputs:{ id:string }
+  steps:
+    - return { id: create_identity(label="fuzzer").id }
+
+###############################################################################
+### 1 ───── FUZZ  onboarding_app  ###########################################
+###############################################################################
+setup app_env:
+  - let founder = new_llid().id
+  - onboarding_flows.bootstrap_core()
+  - onboarding_flows.setup_rbac(founder)
+
+fuzz app_fuzz
+cases: 300
+inputs:
+  - name    : rnd.string(5,12,[a-z])
+  - webhook : rnd.choice([null,"https://hooks.test/"+rnd.string(4,6)])
+  - ro_key  : rnd.bool()
+body:
+  - try {
+      • let out = onboard_app(
+          app_name = inputs.name,
+          owner_llid = founder,
+          create_ro_key = inputs.ro_key,
+          webhook_url  = inputs.webhook
+        )
+      • assert starts_with(out.app_id,"LLID-")
+      • if inputs.ro_key {
+          assert out.api_key_ro != null
+        }
+    } catch any e {
+      • assert contains(e.message,"duplicate")  # idempotência aceita colisão
+    }
+
+###############################################################################
+### 2 ───── FUZZ  onboarding_all idempotente #################################
+###############################################################################
+fuzz cluster_boot_fuzz
+cases: 10
+inputs: {}
+body:
+  - let root = new_llid().id
+  - onboarding_flows.onboarding_all(root)
+  - onboarding_flows.onboarding_all(root)   # executa 2× sem erro
+
+###############################################################################
+### 3 ───── FUZZ  API POST /v2/tasks  Idempotência ###########################
+###############################################################################
+setup api_env:
+  - let llid = new_llid().id
+  - let jwt  = issue_token(id=llid).token
+  - env_set("JWT", jwt)
+
+fuzz api_idem_fuzz
+cases: 100
+inputs:
+  - idem : rnd.choice([uuid_v7(),uuid_v7(),uuid_v7(),"dup-token"])
+  - body : rnd.json({kind:"audit.rotate",payload:{x:rnd.int(0,99)}})
+body:
+  - let resp1 = http.post("http://localhost:8080/v2/tasks",
+        headers={
+          Authorization:concat("Bearer ",env("JWT")),
+          "Idempotency-Key":inputs.idem
+        },
+        json=inputs.body).json
+  - let resp2 = http.post("http://localhost:8080/v2/tasks",
+        headers={
+          Authorization:concat("Bearer ",env("JWT")),
+          "Idempotency-Key":inputs.idem
+        },
+        json=inputs.body).json
+  - assert resp1.task_id == resp2.task_id

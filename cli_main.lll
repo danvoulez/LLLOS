@@ -1,0 +1,276 @@
+###############################################################################
+#  VoulezVous – CLI unificada                                                #
+#  Requer runtime .lll ≥ 1.2                                                 #
+###############################################################################
+
+module cli_main
+version: "1.0.0"
+
+###############################################################################
+# IMPORTS E BOOTSTRAP
+###############################################################################
+import core_boot.*
+import core_logging.*
+import core_db.*
+import core_error.*
+import identity_auth_service.*
+import engine_scheduler.*
+import rules_engine.*
+import timeline_core.*
+import enforcement_policy.*
+import federation_sync.*
+
+###############################################################################
+# VARIÁVEIS DE AMBIENTE (override via --env ou arquivo YAML)
+###############################################################################
+env_set_default("PG_URL",      "postgres://localhost/voulezvous")
+env_set_default("NODE_ID",     "cli-local")
+env_set_default("SERVICE_ID",  "LLID-cli-local")
+
+###############################################################################
+# STARTUP (executa antes de qualquer comando)
+###############################################################################
+on_cli_start:
+  - core_boot.start_core()
+  - core_logging.log(INFO, "VoulezVous CLI ready")
+
+###############################################################################
+# TOPO DE NAVEGAÇÃO
+###############################################################################
+endpoint CLI id
+  description: "Identidades (LLID, tokens, revogação)"
+  subcommands: [create, token, list, revoke]
+
+endpoint CLI task
+  description: "Fila de tarefas (enqueue, tick, listar)"
+  subcommands: [enqueue, tick, list]
+
+endpoint CLI rule
+  description: "Regras de negócio (listar, testar, habilitar)"
+  subcommands: [list, test, toggle]
+
+endpoint CLI quota
+  description: "Quota (incrementar, exibir políticas/uso)"
+  subcommands: [inc, show, policy]
+
+endpoint CLI timeline
+  description: "Eventos ordenados (tail)"
+  subcommands: [tail]
+
+endpoint CLI fed
+  description: "Federação (clusters, handshake, sync)"
+  subcommands: [add, list, handshake, sync]
+
+endpoint CLI gdpr
+  description: "GDPR (req. deleção/anon., status)"
+  subcommands: [request, status]
+
+###############################################################################
+# 1 ─── IDENTIDADES
+###############################################################################
+command id create
+  flags:
+    --scope  (-s) : string  = "PERSON"    # PERSON|APP|API_KEY|OBJECT|CONTRACT
+    --label  (-l) : string               # nome amigável
+    --pqc          : bool    = false     # usar Falcon-1024
+  action:
+    - let res = create_identity(
+        scope  = parse_enum(IdentityScope, flags.scope),
+        label  = flags.label ?? concat(flags.scope, "-", uuid_short()),
+        algo   = flags.pqc ? FALCON1024 : ED25519,
+        set_active = false
+      )
+    - table([{
+        "LLID": res.id,
+        "PRIVATE_KEY": res.private_key
+      }])
+
+command id token
+  flags:
+    --id    (-i) : string  (required)
+    --ttl   (-t) : int     = 60
+    --roles (-r) : string  = "READ_WRITE"     # múltiplos separados por vírgula
+  action:
+    - let tk = issue_token(
+        id  = flags.id,
+        ttl_minutes = flags.ttl,
+        roles = set(map(split(flags.roles,","), r -> parse_enum(Role, trim(r))))
+      )
+    - print(tk.token)
+
+command id list
+  flags: {}
+  action:
+    - let xs = query LogLineID[]
+    - table(map(xs, x -> {
+        "LLID": x.value,
+        "scope": x.scope,
+        "label": x.label,
+        "algo":  x.sig_algo,
+        "created": x.issued_at
+      }))
+
+command id revoke
+  flags:
+    --id      : string (required)
+    --cascade : bool   = true
+    --reason  : string = "cli"
+  action:
+    - revoke_identity(flags.id, flags.reason, flags.cascade, actor_id="cli")
+    - print("revoked:", flags.id)
+
+###############################################################################
+# 2 ─── TAREFAS
+###############################################################################
+command task enqueue
+  flags:
+    --kind    (-k) : string (required)
+    --payload (-p) : json   = {}
+    --run-at  (-r) : string?             # ISO8601
+  action:
+    - let id = enqueue_task(
+        kind    = flags.kind,
+        payload = flags.payload,
+        run_at  = flags.run_at ?? now()
+      ).task_id
+    - print("task:", id)
+
+command task tick
+  flags: { --batch (-b): int = 10 }
+  action:
+    - worker_tick(flags.batch)
+
+command task list
+  flags:
+    --status (-s): string = "PENDING"
+    --limit  (-l): int    = 20
+  action:
+    - let rows = pg.exec(
+        "select id,kind,status,scheduled_at,attempts \
+         from task where status=$1 order by scheduled_at limit $2",
+        [ flags.status, flags.limit ]
+      )
+    - table(rows)
+
+###############################################################################
+# 3 ─── REGRAS
+###############################################################################
+command rule list
+  flags: {}
+  action:
+    - let rs = query rule[]
+    - table(map(rs,r->{
+        id:r.id,name:r.name,expr:r.expr,action:r.action,enabled:r.enabled
+      }))
+
+command rule test
+  flags:
+    --id   (-i): string (required)
+    --json (-j): json   (required)
+  action:
+    - let ok = rules_engine.evaluate(flags.id, flags.json).matched
+    - print(ok ? "MATCH ✅" : "NO MATCH ❌")
+
+command rule toggle
+  flags:
+    --id (-i): string (required)
+    --off     : bool   = false
+  action:
+    - update rule[flags.id] { enabled = !flags.off }
+    - print(flags.off ? "disabled" : "enabled")
+
+###############################################################################
+# 4 ─── QUOTA
+###############################################################################
+command quota inc
+  flags:
+    --tenant (-t): string (required)
+    --scope  (-s): string (required)
+    --amount (-a): int    = 1
+  action:
+    - let res = enforce_quota(flags.tenant, flags.scope, flags.amount)
+    - print(res.allowed ? "✅ allowed" : "❌ blocked")
+
+command quota show
+  flags:
+    --tenant (-t): string (required)
+  action:
+    - let cur = query quota_usage[
+        policy_id in (select id from quota_policy where tenant_id = flags.tenant)
+      ]
+    - table(cur)
+
+command quota policy
+  flags:
+    --tenant (-t): string (required)
+    --scope  (-s): string (required)
+    --limit  (-l): int    (required)
+    --period (-p): string = "DAY"
+  action:
+    - insert quota_policy {
+        id:uuid_v7(), tenant_id:flags.tenant, scope:flags.scope,
+        limit:flags.limit, period:flags.period
+      }
+    - print("policy created")
+
+###############################################################################
+# 5 ─── TIMELINE
+###############################################################################
+command timeline tail
+  flags:
+    --stream (-s): string = "tx"
+    --limit  (-n): int    = 20
+  action:
+    - let evs = query_stream(flags.stream).events
+    - let tail = slice(evs, -flags.limit)
+    - table(map(tail, e -> {
+        lamport:e.lamport,
+        ts:e.created_at,
+        data:e.payload
+      }))
+
+###############################################################################
+# 6 ─── FEDERAÇÃO
+###############################################################################
+command fed add
+  flags:
+    --name (-n): string (required)
+    --url  (-u): string (required)
+  action:
+    - insert remote_cluster {
+        id:uuid_v7(), name:flags.name, base_url:flags.url, active:true
+      }
+    - print("cluster added")
+
+command fed list
+  flags: {}
+  action:
+    - table(query remote_cluster[])
+
+command fed handshake
+  flags: { --id (-i): string (required) }
+  action:
+    - handshake(flags.id)
+    - print("handshake OK")
+
+command fed sync
+  flags: { --id (-i): string (required) }
+  action:
+    - sync_once(flags.id)
+
+###############################################################################
+# 7 ─── GDPR
+###############################################################################
+command gdpr request
+  flags:
+    --subject (-s): string (required)
+    --kind    (-k): string = "DELETE"
+  action:
+    - let id = request_gdpr(flags.subject, flags.kind).req_id
+    - print("request id:", id)
+
+command gdpr status
+  flags: { --id (-i): string (required) }
+  action:
+    - let st = fetch gdpr_request[flags.id].status
+    - print("status:", st)

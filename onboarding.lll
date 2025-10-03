@@ -1,0 +1,94 @@
+###############################################################################
+module onboarding
+version: "1.0.0"
+###############################################################################
+import core_boot.*
+import core_db.*
+import core_logging.*
+import rbac.*
+import enforcement_policy.*
+import rules_engine.*
+import federation_sync.*
+import dashboards.*
+import api_gateway.*
+import system_workflows.*
+
+###############################################################################
+# 1 │ “FATORES” (Defaults)
+###############################################################################
+const DEMO_TENANT  = "demo"
+const DEMO_CLUSTER = "loopback"
+const CERT_PATH    = "/certs/demo.pem"
+const KEY_PATH     = "/certs/demo.key"
+
+###############################################################################
+# 2 │ FLUXO ÚNICO DE ONBOARDING
+###############################################################################
+flow full_onboarding
+  inputs:
+    - owner_llid: string            # seu LLID fundador
+  steps:
+    ── CORE BOOT ─────────────────────────────────────────────────────────
+    - core_boot.start_core()
+
+    ── RBAC BÁSICO ───────────────────────────────────────────────────────
+    - create_permission("tasks.enqueue","Enfileirar tarefas")
+    - create_permission("rules.read","Listar regras")
+    - create_permission("events.subscribe","Assinar WS")
+
+    - create_role("ADMIN","Tudo liberado")
+    - grant_permission("ADMIN","tasks.enqueue")
+    - grant_permission("ADMIN","rules.read")
+    - grant_permission("ADMIN","events.subscribe")
+
+    - bind_role(owner_llid,"ADMIN","*")
+
+    ── QUOTA DEMO ───────────────────────────────────────────────────────
+    - insert quota_policy {
+        id:uuid_v7(), tenant_id:DEMO_TENANT,
+        scope:"llm.calls", limit:1000, period:"DAY"
+      }
+
+    ── REGRA DEMO ───────────────────────────────────────────────────────
+    - insert rule {
+        id:uuid_v7(), name:"alert_big_tx",
+        expr:"amount > 10000", action:"notify.ops", enabled:true
+      }
+
+    ── FEDERAÇÃO LOOPBACK ──────────────────────────────────────────────
+    - insert remote_cluster {
+        id:uuid_v7(), name:DEMO_CLUSTER,
+        base_url:"http://localhost:8080", active:true
+      }
+
+    ── TLS DEV CERT (se ausente) ───────────────────────────────────────
+    - if !file.exists(CERT_PATH) {
+        • file.gen_selfsigned(cert=CERT_PATH, key=KEY_PATH,
+                              subject="CN=VoulezVous Dev")
+        • core_logging.log(WARN,"cert self-signed criado",{CERT_PATH})
+      }
+    - env_set("TLS_CERT", CERT_PATH)
+    - env_set("TLS_KEY",  KEY_PATH)
+
+    ── DASH + OBSERVAÇÃO ───────────────────────────────────────────────
+    - dashboards.start()             # endpoints /dash
+
+    ── GATEWAY + WORKFLOWS ─────────────────────────────────────────────
+    - api_gateway.start()            # HTTPS/2 porta 8080
+    - system_workflows.bootstrap_cluster()
+
+    ── LOG FINAL ───────────────────────────────────────────────────────
+    - core_logging.log(INFO,"Onboarding completo!",
+        { owner:owner_llid, tenant:DEMO_TENANT })
+
+###############################################################################
+# 3 │ CLI
+###############################################################################
+endpoint CLI onb
+  subcommands:[init]
+
+command onb init
+  flags:{ --me (-m):string (required) }
+  action:
+    - full_onboarding(flags.me)
+    - print("\n✅ Stack pronto! Abra https://localhost:8080/dash/mini\n")

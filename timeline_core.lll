@@ -1,0 +1,95 @@
+module timeline_core
+version: "0.1.0"
+
+import core_db.*
+import core_logging.*
+
+# ──────────── ENTIDADES ────────────
+entity TimelineEvent
+  key: id (uuid)                     # uuid_v7()
+  properties:
+    - stream: string                 # por ex.: "tx", "identity", "audit"
+    - payload: json
+    - vc: json                       # vector-clock { node:int }
+    - lamport: int
+    - created_at: timestamptz = now()
+
+entity VectorClockState
+  key: node (string)
+  properties:
+    - counter: int = 0
+    - updated_at: timestamptz = now()
+
+# ──────────── HELPERS ──────────────
+behavior next_vc
+  outputs: { vc: json, lamport: int }
+  steps:
+    - let node = env("NODE_ID")      # ex.: "web-1"
+    - let st = upsert VectorClockState[node] {
+        counter = coalesce(counter,0) + 1,
+        updated_at = now()
+      }
+    - let lam = st.counter
+    - return { vc: { (node) : st.counter }, lamport: lam }
+
+behavior merge_vc
+  inputs: { a: json, b: json }
+  outputs: { vc: json }
+  steps:
+    - let keys = union(keys(a), keys(b))
+    - let out  = {}
+    - for k in keys :
+        • out[k] = max(a[k]??0, b[k]??0)
+    - return { vc: out }
+
+# ──────────── APPEND  ──────────────
+flow append_event
+  inputs:
+    - stream: string
+    - payload: json
+    - vc_external?: json             # opcional p/ merge off-line
+    - lamport_external?: int
+  outputs: { event_id: uuid }
+  steps:
+    - let local = next_vc()
+    - let vc_final   = vc_external ? merge_vc(local.vc, vc_external).vc : local.vc
+    - let lam_final  = max(local.lamport, lamport_external??0)
+    - let ev_id = uuid_v7()
+    - pg.exec(
+        "insert into timeline_event(id,stream,payload,vc,lamport) \
+         values ($1,$2,$3,$4,$5)",
+        [ ev_id, stream, payload, vc_final, lam_final ]
+      )
+    - core_logging.log(DEBUG, "timeline append", { stream, ev_id, lam_final })
+    - return { event_id: ev_id }
+
+# ──────────── QUERY & MERGE  ────────────
+flow query_stream
+  inputs:
+    - stream: string
+    - since_lamport?: int = 0
+  outputs: { events: list<TimelineEvent> }
+  steps:
+    - let evs = pg.exec(
+        "select * from timeline_event \
+         where stream=$1 and lamport > $2 \
+         order by lamport",
+        [ stream, since_lamport ]
+      )
+    - return { events: evs }
+
+flow merge_external
+  inputs:
+    - batch: list<json>              # [{stream,payload,vc,lamport}]
+  outputs: { imported: int }
+  steps:
+    - let n = 0
+    - for e in batch :
+        • append_event(
+            stream = e.stream,
+            payload= e.payload,
+            vc_external = e.vc,
+            lamport_external = e.lamport
+          )
+        • n = n + 1
+    - return { imported: n }

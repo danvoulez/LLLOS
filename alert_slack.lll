@@ -1,0 +1,60 @@
+###############################################################################
+module alert_slack
+version: "1.0.0"
+###############################################################################
+import core_logging.*
+import event_bus.*
+import engine_scheduler.*
+
+const HOOK_URL      = env("SLACK_WEBHOOK_URL","")   # https://hooks.slack.com/…
+const MAX_ATTEMPTS  = 6
+
+entity SlackJob
+  key: id (uuid)
+  properties:
+    - payload : json
+    - attempts: int = 0
+    - next_try: datetime = now()
+    - done    : bool = false
+    - last_err: string?
+
+###############################################################################
+# 1 │ fila + re-try  (enqueue on alert)
+###############################################################################
+event_bus.subscribe("alert", (a) -> {
+  if HOOK_URL == "" { core_logging.log(WARN,"hook url faltando"); return }
+  insert slackjob { id:uuid_v7(), payload:a }
+})
+
+###############################################################################
+# 2 │ entregador
+###############################################################################
+behavior deliver
+  inputs:{ job:SlackJob }
+  steps:
+    - try {
+        http.post(url=HOOK_URL, json={
+          text: concat("*ALERTA*: ", job.payload.name,
+                       "\n```", stringify(job.payload.detail??""), "```")
+        }, timeout="5s")
+        update slackjob[job.id] { done=true }
+      } catch any e {
+        let n = job.attempts + 1
+        update slackjob[job.id] {
+          attempts=n,
+          next_try = now() + duration(minutes=pow(2,n)),   # 2,4,8,…
+          last_err = e.message
+        }
+        if n >= MAX_ATTEMPTS {
+          core_logging.log(ERROR,"Slack alert FAILED permanent",{job:e.message})
+        }
+      }
+
+###############################################################################
+# 3 │ cron dispatch
+###############################################################################
+cron slack_dispatch
+  every:"*/1 * * * *"               # a cada minuto
+  steps:
+    - for j in query slackjob[done=false, next_try<=now()] limit 20 :
+        • deliver(j)

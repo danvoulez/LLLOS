@@ -1,0 +1,124 @@
+module enforcement_policy
+version: "0.1.0"
+
+import core_db.*
+import core_logging.*
+import core_error.*
+import engine_scheduler.{ enqueue_task }
+import timeline_core.append_event
+
+# ─────────── ENTIDADES ───────────
+entity QuotaPolicy
+  key: id (uuid)
+  properties:
+    - tenant_id: string
+    - scope: string                # "api_calls", "storage_mb", etc.
+    - limit: int
+    - period: string               # "DAY", "MONTH"
+    - created_at: datetime = now()
+
+entity QuotaUsage
+  key: id (uuid)
+  properties:
+    - policy_id: uuid
+    - window_start: datetime
+    - used: int = 0
+    - updated_at: datetime = now()
+
+entity GdprRequest
+  key: id (uuid)
+  properties:
+    - subject_id: string          # LLID da pessoa
+    - kind: string                # "DELETE" | "ANONYMIZE"
+    - status: string = "PENDING"  # PENDING | DONE | ERROR
+    - requested_at: datetime = now()
+    - completed_at: datetime?
+
+# ─────────── QUOTA ENGINE ───────────
+behavior current_window_start
+  inputs: { period: string }
+  outputs: { start: datetime }
+  steps:
+    - match period {
+        case "DAY"   ⇒ return { start: date_trunc("day", now()) }
+        case "MONTH" ⇒ return { start: date_trunc("month", now()) }
+      }
+
+behavior increment_usage
+  inputs:
+    - policy: QuotaPolicy
+    - amount: int = 1
+  outputs: { allowed: bool, remaining: int }
+  steps:
+    - let win = current_window_start(policy.period).start
+    - let usage = upsert QuotaUsage[policy.id, win] {
+        used = coalesce(used,0) + amount,
+        updated_at = now()
+      }
+    - let allowed = usage.used <= policy.limit
+    - append_event("quota", {
+        tenant:policy.tenant_id, scope:policy.scope,
+        used:usage.used, allowed
+      })
+    - return { allowed, remaining: policy.limit - usage.used }
+
+flow enforce_quota
+  inputs:
+    - tenant_id: string
+    - scope: string
+    - amount?: int = 1
+  outputs: { allowed: bool }
+  steps:
+    - let pol = fetch QuotaPolicy[
+        tenant_id = tenant_id, scope = scope
+      ] ? core_error.raise_error(NOT_FOUND,"quota policy")
+    - let res = increment_usage(pol, amount)
+    - if !res.allowed {
+        core_logging.log(WARN, "quota exceeded", { tenant_id, scope })
+      }
+    - return { allowed: res.allowed }
+
+# ─────────── RULES ACTION HOOK ───────────
+rules_engine.exec_action.register(
+  "enforce.quota",
+  (payload) -> enforce_quota(
+      tenant_id = payload.tenant,
+      scope     = payload.scope,
+      amount    = payload.amount ?? 1
+  )
+)
+
+# ─────────── GDPR WORKFLOW ───────────
+flow request_gdpr
+  inputs:
+    - subject_id: string
+    - kind?: string = "DELETE"      # ou ANONYMIZE
+  outputs: { req_id: uuid }
+  steps:
+    - let id = uuid_v7()
+    - insert gdpr_request { id, subject_id, kind }
+    - enqueue_task("gdpr.process", { req_id:id })
+    - append_event("gdpr", { subject_id, kind, id })
+    - return { req_id: id }
+
+behavior process_gdpr_job
+  inputs: { payload: json }
+  steps:
+    - let req = fetch GdprRequest[payload.req_id]
+    - try {
+        • match req.kind {
+            case "DELETE"   ⇒ delete_personal_data(req.subject_id)
+            case "ANONYMIZE"⇒ anonymize_personal_data(req.subject_id)
+          }
+        • update gdpr_request[req.id] {
+            status="DONE", completed_at=now()
+          }
+        • append_event("gdpr", { id:req.id, status:"DONE" })
+      } catch any e {
+        • update gdpr_request[req.id] { status="ERROR" }
+        • append_event("gdpr", { id:req.id, status:"ERROR", error:stringify(e) })
+        • core_logging.log(ERROR,"gdpr error",{req_id:req.id,error:e})
+      }
+
+# liga handler no engine
+engine_scheduler.run_task.register("gdpr.process", process_gdpr_job)

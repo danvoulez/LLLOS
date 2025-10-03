@@ -1,0 +1,66 @@
+###############################################################################
+module cert_manager
+version: "0.1.0"
+###############################################################################
+import core_logging.*
+import telemetry_core.*
+
+const DOMAIN        = env("TLS_DOMAIN", "dev.voulezvous.local")
+const CERT_PATH     = concat("/certs/", DOMAIN, ".pem")
+const KEY_PATH      = concat("/certs/", DOMAIN, ".key")
+const RENEW_DAYS_BEFORE = 28          # renew when <28 d left
+
+###############################################################################
+# 1 │ obtain or renew
+###############################################################################
+flow obtain_cert
+  outputs:{ ok:bool }
+  steps:
+    - core_logging.log(INFO,"ACME start",{domain:DOMAIN})
+    - try {
+        • file.acme_request(
+            domain = DOMAIN,
+            cert_path = CERT_PATH,
+            key_path  = KEY_PATH,
+            contact_email = "ops@voulezvous.io"
+          )
+        • env_set("TLS_CERT", CERT_PATH)
+        • env_set("TLS_KEY",  KEY_PATH)
+        • telemetry_core.inc_counter("cert.acme_ok")
+        • core_logging.log(INFO,"ACME cert issued",{CERT_PATH})
+        • return { ok:true }
+      } catch any e {
+        • telemetry_core.inc_counter("cert.acme_fail")
+        • core_logging.log(ERROR,"ACME failed, fallback self-signed",{e:e.message})
+        • if !file.exists(CERT_PATH) {
+            file.gen_selfsigned(cert=CERT_PATH,key=KEY_PATH,subject=concat("CN=",DOMAIN))
+          }
+        • env_set("TLS_CERT", CERT_PATH)
+        • env_set("TLS_KEY",  KEY_PATH)
+        • return { ok:false }
+
+###############################################################################
+# 2 │ helper to check expiry
+###############################################################################
+behavior days_left
+  outputs:{ days:int }
+  steps:
+    - if !file.exists(CERT_PATH) { return { days:0 } }
+    - let meta = file.cert_info(CERT_PATH)      # returns {not_after:datetime}
+    - return { days: diff_days(meta.not_after, now()) }
+
+###############################################################################
+# 3 │ cron renew
+###############################################################################
+cron cert_watch
+  every:"0 4 * * *"              # daily 04:00 UTC
+  steps:
+    - let dl = days_left().days
+    - if dl < RENEW_DAYS_BEFORE {
+        obtain_cert()
+      }
+
+###############################################################################
+# 4 │ bootstrap on start
+###############################################################################
+on_app_start: obtain_cert()

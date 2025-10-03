@@ -1,0 +1,38 @@
+module pg_ws_bridge
+version: "0.1.0"
+
+import core_db.*
+import event_bus.*
+import timeline_core.*
+
+# 1. Cria função SQL que dispara NOTIFY
+migration pg_notify_trigger order 99
+  create function emit_notify() returns trigger language plpgsql as $$
+  declare
+    payload json;
+  begin
+    payload := row_to_json(NEW);
+    perform pg_notify('app_events', payload::text);
+    return NEW;
+  end $$;
+
+  do $$ begin
+    if not exists (
+      select 1 from pg_trigger where tgname='timeline_notify') then
+      execute 'create trigger timeline_notify
+        after insert on timeline_event
+        for each row execute function emit_notify()';
+    end if;
+  end $$;
+
+# 2. Listener em tempo-real
+behavior listen_db
+  steps:
+    - pg.listen("app_events", (msg) -> {
+        let json = parse_json(msg.payload)
+        publish("timeline", json)        # 🡒 EventBus
+      })
+    - core_logging.log(INFO,"pg listener running")
+
+# 3. Autostart
+on_app_start: listen_db()

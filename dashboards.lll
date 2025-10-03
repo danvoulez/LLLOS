@@ -1,0 +1,109 @@
+###############################################################################
+# dashboards.lll — visualização de métricas sem Grafana                       #
+###############################################################################
+module dashboards
+version: "0.1.0"
+
+import observer_puro.{ MetricGauge, MetricCounter }
+
+###############################################################################
+# 1 ─── DATASOURCE LOCAL (PROM-LIKE)
+###############################################################################
+behavior fetch_metrics
+  outputs: { gauges: json, counters: json }
+  steps:
+    - let g = map(query metricgauge[], x -> { (x.key) : x.value })
+    - let c = map(query metriccounter[], x -> { (x.key) : x.value })
+    - return { gauges:g, counters:c }
+
+###############################################################################
+# 2 ─── UI COMPONENTS  (gráficos SVG nativos do runtime .lll)
+###############################################################################
+component line_chart
+  props: { label:string, values:list<float> }
+  template:
+    <svg width="300" height="100" viewBox="0 0 300 100">
+      <polyline
+        points="{{ join(map(enumerate(props.values),
+               p -> concat(p.index * 10, ',', 100 - p.value)), ' ') }}"
+        fill="none" stroke="steelblue" stroke-width="2"/>
+      <text x="5" y="15" font-size="12">{{ props.label }}</text>
+    </svg>
+
+component value_box
+  props: { label:string, value:any }
+  template:
+    <div style="border:1px solid #ccc;padding:8px;margin:4px">
+      <div style="font-size:12px">{{ props.label }}</div>
+      <div style="font-size:20px">{{ props.value }}</div>
+    </div>
+
+###############################################################################
+# 3 ─── DASHBOARD PRINCIPAL
+###############################################################################
+endpoint GET /dash
+  description: "Dashboard simples estilo Grafana"
+  handler:
+    - let m = fetch_metrics()
+    - let html = """
+        <html><head><title>Dashboard</title>
+        <meta http-equiv="refresh" content="15">
+        </head><body style='font-family:Arial'>
+          <h2>Cluster Metrics (auto-refresh 15 s)</h2>
+          <div style='display:flex;flex-wrap:wrap'>
+            {{ value_box({label:'Tasks pendentes',value:m.gauges['tasks.pending']}) }}
+            {{ value_box({label:'Lamport head',value:m.gauges['timeline.lamport']}) }}
+            {{ value_box({label:'Quota blocked',value:m.counters['quota.blocked']}) }}
+            {{ value_box({label:'Warn logs',value:m.counters['log.warn']}) }}
+            {{ value_box({label:'Error logs',value:m.counters['log.error']}) }}
+          </div>
+
+          <h3>Evolução de quota bloqueada (últimos 30 min)</h3>
+          {{ line_chart({
+               label:'quota.blocked_total',
+               values: map(range(0,30),
+                   i -> fetch MetricCounter['quota.blocked_total'].value ?? 0)
+          }) }}
+        </body></html>
+      """
+    - return html
+
+###############################################################################
+# 4 ─── DASHBOARD POR TENANT
+###############################################################################
+endpoint GET /dash/quota/{tenant}
+  description: "Visão de quota detalhada por tenant"
+  handler:
+    - let tid = params.tenant
+    - let pols = query quota_policy[tenant_id = tid]
+    - let usage = query quota_usage[
+        policy_id in (select id from quota_policy where tenant_id = tid),
+        window_start = date_trunc("day", now())
+      ]
+    - let html = """
+        <html><body>
+        <h2>Quota – Tenant {{ tid }}</h2>
+        <table border=1 cellpadding=4>
+          <tr><th>Scope</th><th>Used</th><th>Limit</th></tr>
+          {{ join(map(pols, p -> concat(
+            '<tr><td>',p.scope,'</td><td>',
+            (fetch quota_usage[policy_id=p.id, window_start=date_trunc("day",now())].used ?? 0),
+            '</td><td>',p.limit,'</td></tr>'
+          )), '') }}
+        </table>
+        </body></html>
+      """
+    - return html
+
+###############################################################################
+# 5 ─── CLI ATALHO
+###############################################################################
+endpoint CLI dash
+  description: "Abre dashboard no browser"
+  subcommands: [open]
+
+command dash open
+  flags:
+    --url : string = "http://localhost:8080/dash"
+  action:
+    - shell("xdg-open "+flags.url)   # macOS: open

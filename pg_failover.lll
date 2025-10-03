@@ -1,0 +1,64 @@
+###############################################################################
+module pg_failover
+version: "0.1.0"
+###############################################################################
+import core_db.*
+import core_logging.*
+import telemetry_core.*
+
+const PRIMARY = env("PG_PRIMARY_URL")
+const REPLICA = env("PG_REPLICA_URL")
+const PROMOTE_CMD? = env("PG_PROMOTE_CMD", "")
+
+state active_url : string = PRIMARY
+state last_switch: datetime = now()
+
+# ───────── helper: switch datasource at runtime ─────────
+behavior switch_to
+  inputs:{ url:string }
+  steps:
+    - if url == active_url { return }            # already there
+    - datasource pg @main { url:url, pool:15 }   # hot-reload
+    - active_url = url
+    - last_switch = now()
+    - env_set("PG_URL", url)
+    - telemetry_core.inc_counter("pg_failover.switch")
+    - core_logging.log(WARN,"DB SWITCH",{url})
+
+# ───────── helper: promote standby  (optional) ─────────
+behavior promote_standby
+  outputs:{ ok:bool }
+  steps:
+    - if PROMOTE_CMD == "" { return {ok:false} }
+    - shell(PROMOTE_CMD)       # pg_ctl promote
+    - core_logging.log(WARN,"standby promote cmd executed")
+    - return { ok:true }
+
+# ───────── cron watchdog (every 15 s) ─────────
+cron pg_watchdog
+  every:"*/15 * * * * *"
+  steps:
+    - try {
+        pg.connect(active_url).exec("select 1")
+        return                     # active healthy
+      } catch any e {
+        core_logging.log(ERROR,"primary down",{err:e.message})
+      }
+
+    # ➊ primary unhealthy ― attempt fail-over
+    - if active_url == PRIMARY {
+        • try {
+            pg.connect(REPLICA).exec("select 1")
+            switch_to(REPLICA)         # read-only but alive
+            promote_standby()
+          } catch any e2 {
+            core_logging.log(ERROR,"replica also down",{e:e2.message})
+          }
+        • return
+      }
+
+    # ➋ we are on replica; check if primary recovered
+    - try {
+        pg.connect(PRIMARY).exec("select 1")
+        switch_to(PRIMARY)
+      } catch any {}

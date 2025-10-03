@@ -1,0 +1,20 @@
+module core_config
+version: "0.1.0"
+
+entity Config
+  key: name (string)                 # "default", "test", etc.
+  properties:
+    - data: json
+    - loaded_at: datetime = now()
+
+flow load_config
+  inputs:
+    - path: string = "config/default.yaml"
+    - profile?: string = "default"
+  outputs: { config: Config }
+  steps:
+    - let raw_yaml = file.read(path)
+      ? "config file missing"
+    - let data_json = yaml_to_json(raw_yaml)
+    - upsert Config[profile] { data = data_json, loaded_at = now() }
+    - return { config: last_upserted(Config) }

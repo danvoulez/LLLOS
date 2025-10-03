@@ -1,0 +1,153 @@
+###############################################################################
+# llm_contracts.lll  –  Contrato interno para uso de LLM                     #
+###############################################################################
+module llm_contracts
+version: "0.1.0"
+
+import identity_auth_service.*
+import timeline_core.*
+import core_logging.*
+import enforcement_policy.*
+import rules_engine.*
+
+###############################################################################
+# 1 ─── ENTIDADES PRINCIPAIS
+###############################################################################
+entity LlmSession
+  key: id (uuid)
+  properties:
+    - caller_id: string                 # LLID de quem faz a chamada
+    - model: string                     # gpt-4o, mixtral-8x7b, etc.
+    - purpose: string                   # "chat", "summarize", ...
+    - started_at: datetime = now()
+    - ended_at: datetime?
+    - blocked: bool = false
+    - trace_uri: string?                # NDJSON de trace
+
+entity LlmMessage
+  key: id (uuid)
+  properties:
+    - session_id: uuid
+    - role: string                      # user|assistant|system
+    - content: string
+    - citations: json?                  # [{source:"url", span:""}]
+    - hallucination_score: float?       # 0‒1 (1=seguro)
+    - created_at: datetime = now()
+
+###############################################################################
+# 2 ─── PARÂMETROS DE CONTRATO
+###############################################################################
+const MAX_TOKENS          = 8_000
+const MIN_GROUNDING_SCORE = 0.70
+
+###############################################################################
+# 3 ─── ABERTURA DE SESSÃO  (assinada)
+###############################################################################
+flow start_session
+  inputs:
+    - caller_id: string                 # LLID
+    - model: string
+    - purpose: string
+    - token_bearer: string              # JWT de caller (Falcon)
+  outputs: { session_id: uuid }
+  steps:
+    - verify_access(token_bearer, READ_WRITE)   # identidade confere
+    - enforce_quota(get_tenant(caller_id), "llm.calls")
+    - let sid = uuid_v7()
+    - insert llm_session { id:sid, caller_id, model, purpose }
+    - append_event("llm", { type:"open", sid, caller_id, model })
+    - return { session_id:sid }
+
+###############################################################################
+# 4 ─── ENVIO DE MENSAGEM → VERIFICAÇÕES
+###############################################################################
+flow send_message
+  inputs:
+    - session_id: uuid
+    - role: string
+    - content: string
+  outputs: { answer: string }
+  steps:
+    # sessão & quota
+    - let sess = fetch llm_session[session_id]
+      ? raise_error(UNAUTHORIZED,"sess")
+    - enforce_quota(get_tenant(sess.caller_id), "llm.tokens",
+                    tokens_of(content))
+
+    # insere mensagem do usuário
+    - let mid = uuid_v7()
+    - insert llm_message { id:mid, session_id, role, content }
+
+    # chama provedor real (fora do escopo)
+    - let resp = provider.call(
+        model=sess.model, content=transform_prompt(content),
+        max_tokens=MAX_TOKENS
+      )
+
+    # grounding check
+    - let score = grounding.score(resp.text, resp.citations)
+    - if score < MIN_GROUNDING_SCORE {
+        • update llm_session[session_id] { blocked=true, ended_at=now() }
+        • rules_engine.evaluate(rule_id="RULE_LOW_GROUND", input={
+            caller:sess.caller_id, score
+          })
+        • raise_error(VALIDATION, "Hallucination risk")
+      }
+
+    # grava resposta com citações e score
+    - insert llm_message {
+        id:uuid_v7(), session_id, role:"assistant",
+        content:resp.text, citations:resp.citations,
+        hallucination_score:score
+      }
+
+    # timeline + auditoria
+    - append_event("llm", {type:"msg", sid:session_id, rid:mid,
+                           tokens:tokens_of(resp.text), score})
+
+    - return { answer: resp.text }
+
+###############################################################################
+# 5 ─── ENCERRA SESSÃO
+###############################################################################
+flow end_session
+  inputs: { session_id: uuid }
+  steps:
+    - update llm_session[session_id] { ended_at=now() }
+    - append_event("llm",{type:"close",sid:session_id})
+
+###############################################################################
+# 6 ─── REGRA AUTOMÁTICA  (ACCOUNTABILITY)
+###############################################################################
+rule low_ground
+  when  score < 0.7
+  then  action "notify.ops"
+
+rules_engine.import_rule("RULE_LOW_GROUND", low_ground)
+
+###############################################################################
+# 7 ─── CLI UTIL
+###############################################################################
+endpoint CLI llm
+  subcommands:[open, send, close]
+
+command llm open
+  flags:{ --id (-i):string --model:string=gpt-4o --purpose:string="chat" }
+  action:
+    - let sid = start_session(
+        caller_id=flags.id, model=flags.model,
+        purpose=flags.purpose, token_bearer=env("JWT")
+      ).session_id
+    - print("session:",sid)
+
+command llm send
+  flags:{ --sid:string (required) --msg:string (required) }
+  action:
+    - let ans = send_message(flags.sid,"user",flags.msg).answer
+    - print(ans)
+
+command llm close
+  flags:{ --sid:string (required) }
+  action:
+    - end_session(flags.sid)
+    - print("bye")

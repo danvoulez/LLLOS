@@ -1,0 +1,24 @@
+###############################################################################
+module ws_gateway_patch
+version: "0.1.0"
+###############################################################################
+import api_gateway.*        # assume que api_gateway já existe
+import event_bus.*
+import rbac.*
+
+# ---------------- mapa de clientes conectados -------------------------------
+state ws_clients : map<string,socket> = {}
+
+# 1. endpoint WebSocket (mesma rota ou nova) ----------------------------------
+endpoint WS /v2/events
+  auth: guard("events.subscribe")          # reaproveita guard() do gateway
+  on_connect:   ws_clients[client.id] = client
+  on_disconnect: delete ws_clients[client.id]
+  on_message:   send(client,"pong")
+
+# 2. pub/sub – qualquer payload vindo de EventBus["pg"] vai aos clientes ------
+event_bus.subscribe("pg", (ev) -> {
+  for each id,sock in ws_clients {
+    send(sock, stringify(ev))
+  }
+})

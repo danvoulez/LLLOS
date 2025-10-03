@@ -1,0 +1,146 @@
+###############################################################################
+# rbac.lll – Controle de Acesso Baseado em Funções                            #
+###############################################################################
+module rbac
+version: "0.1.0"
+
+import core_logging.*
+import core_error.*
+import identity_auth_service.*
+import timeline_core.*
+
+###############################################################################
+# 1 │ ENTIDADES
+###############################################################################
+entity Permission
+  key: name (string)                    # "rules.read", "tasks.enqueue"
+  properties:
+    - desc: string
+
+entity Role
+  key: name (string)                    # "ADMIN", "DEVOPS"
+  properties:
+    - desc: string
+
+entity RolePermission
+  key: (role, perm)                     # composição
+  properties: {}
+
+entity RoleBinding
+  key: id (uuid)
+  properties:
+    - principal_id: string             # LLID
+    - role: string
+    - scope: string? = "*"             # tenant ou global
+    - created_at: datetime = now()
+    - revoked_at: datetime?
+
+###############################################################################
+# 2 │ FLUXOS DE ADMINISTRAÇÃO
+###############################################################################
+flow create_permission
+  inputs: { name:string, desc?:string="" }
+  steps:
+    - insert permission { name, desc }
+    - timeline_core.append_event("rbac", {type:"perm.create", name})
+
+flow create_role
+  inputs: { name:string, desc?:string="" }
+  steps:
+    - insert role { name, desc }
+    - timeline_core.append_event("rbac", {type:"role.create", name})
+
+flow grant_permission
+  inputs: { role:string, perm:string }
+  steps:
+    - insert rolepermission { role, perm }
+    - timeline_core.append_event("rbac", {type:"grant", role, perm})
+
+flow bind_role
+  inputs: { principal:string, role:string, scope?:string="*" }
+  outputs:{ binding_id:uuid }
+  steps:
+    - let id = uuid_v7()
+    - insert rolebinding { id, principal_id:principal, role, scope }
+    - timeline_core.append_event("rbac",{type:"bind",principal,role})
+    - return { binding_id:id }
+
+flow revoke_binding
+  inputs: { binding_id:uuid }
+  steps:
+    - update rolebinding[binding_id] { revoked_at=now() }
+    - timeline_core.append_event("rbac",{type:"revoke",binding_id})
+
+###############################################################################
+# 3 │ VERIFICAÇÃO CENTRAL
+###############################################################################
+behavior check_access
+  inputs:
+    - principal_id: string
+    - perm: string
+    - scope?: string="*"
+  outputs:{ allowed:bool }
+  steps:
+    - let roles = query rolebinding[
+        principal_id = principal_id,
+        revoked_at = null,
+        (scope = "*" or scope = scope)
+      ].role
+    - if size(roles)==0 { return { allowed:false } }
+    - let ok = exists rolepermission[
+        role in roles, perm = perm
+      ]
+    - return { allowed:ok }
+
+###############################################################################
+# 4 │ INTEGRAÇÃO COM ENDPOINTS EXISTENTES
+###############################################################################
+# substitua chamadas 'verify_access' nos handlers públicos por:
+#   ensure rbac.check_access(caller_llid,"tasks.enqueue").allowed
+# ou, em flows .lll internos:
+#   enforce_quota(...)   # já existente
+#   ensure rbac.check_access(...)        # novo
+
+###############################################################################
+# 5 │ MIGRAÇÕES SQL
+###############################################################################
+migration V8__rbac order 8
+  create table permission (
+    name text primary key,
+    desc text
+  );
+  create table role (
+    name text primary key,
+    desc text
+  );
+  create table rolepermission (
+    role text references role(name),
+    perm text references permission(name),
+    primary key (role,perm)
+  );
+  create table rolebinding (
+    id uuid primary key,
+    principal_id text,
+    role text references role(name),
+    scope text,
+    created_at timestamptz,
+    revoked_at timestamptz
+  );
+
+###############################################################################
+# 6 │ CLI UTIL
+###############################################################################
+endpoint CLI rbac
+  subcommands:[perm, role, bind]
+
+command rbac perm
+  flags:{ --name:string --desc?:string="" }
+  action: create_permission(flags.name, flags.desc)
+
+command rbac role
+  flags:{ --name:string --desc?:string="" }
+  action: create_role(flags.name, flags.desc)
+
+command rbac bind
+  flags:{ --id:string --role:string --scope?:string="*" }
+  action: bind_role(flags.id, flags.role, flags.scope)

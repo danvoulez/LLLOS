@@ -1,0 +1,103 @@
+module federation_sync
+version: "0.1.0"
+
+import core_db.*
+import core_logging.*
+import identity_auth_service.{ issue_token }
+import timeline_core.{ query_stream, merge_external }
+import engine_scheduler.{ enqueue_task }
+
+# ──────────── ENTIDADES ────────────
+entity RemoteCluster
+  key: id (uuid)
+  properties:
+    - name: string                     # "eu-west-1", "us-east-1", etc.
+    - base_url: string                 # https://cluster.example.com
+    - last_handshake: datetime?
+    - active: bool = true
+    - created_at: datetime = now()
+
+entity SyncCursor
+  key: cluster_id (uuid)
+  properties:
+    - stream: string                   # "tx", "rules", "gdpr" …
+    - lamport: int = 0
+    - updated_at: datetime = now()
+
+# ─────────── HANDSHAKE ────────────
+flow handshake
+  inputs:
+    - cluster_id: uuid
+  outputs: { ok: bool }
+  steps:
+    - let rc = fetch RemoteCluster[cluster_id]
+      ? core_error.raise_error(NOT_FOUND,"cluster")
+    - let tok = issue_token(            # token assinado Falcon-1024
+        id = env("SERVICE_ID"),         # LLID do nó
+        ttl_minutes = 5
+      )
+    - let res = http.post(
+        url = concat(rc.base_url,"/fed/ping"),
+        headers = { Authorization: concat("Bearer ", tok.token) },
+        json = { node: env("NODE_ID") }
+      )
+    - ensure res.status == 200 ? core_error.raise_error(
+        INTERNAL, concat("handshake fail ", res.status))
+    - update remote_cluster[rc.id] { last_handshake = now() }
+    - core_logging.log(INFO,"federation handshake OK",{ rc:rc.name })
+    - return { ok:true }
+
+# ─────────── SYNC OUTBOUND ───────────
+behavior push_deltas
+  inputs:
+    - cluster: RemoteCluster
+    - stream: string
+  outputs: { sent: int }
+  steps:
+    - let cur  = fetch SyncCursor[cluster.id, stream] ?? { lamport:0 }
+    - let evs  = query_stream(stream, cur.lamport).events
+    - if size(evs)==0 { return { sent:0 } }
+    - let tok = issue_token(id=env("SERVICE_ID"), ttl_minutes=5).token
+    - http.post(
+        url = concat(cluster.base_url, "/fed/inbound"),
+        headers = { Authorization: concat("Bearer ", tok) },
+        json = { stream, events: evs }
+      )
+    - upsert SyncCursor[cluster.id, stream] {
+        lamport = evs[-1].lamport, updated_at = now()
+      }
+    - return { sent: size(evs) }
+
+# ─────────── SYNC INBOUND ENDPOINT ───────────
+endpoint POST /fed/inbound
+  request: { json {
+      stream: string,
+      events: list<json>
+    }}
+  auth: verify_access(required_role=READ_WRITE)   # identidade do cluster remoto
+  handler:
+    - merge_external(request.json.events)
+    - return { ok:true }
+
+endpoint POST /fed/ping
+  request: { json { node:string } }
+  auth: verify_access(required_role=READ_ONLY)
+  handler:
+    - return { pong: env("NODE_ID") }
+
+# ─────────── JOB ÚNICO DE SYNC ───────────
+behavior sync_once
+  inputs: { cluster_id: uuid }
+  steps:
+    - let rc = fetch RemoteCluster[cluster_id]
+    - for stream in ["tx","rules","gdpr","quota"] :
+        • let n = push_deltas(rc, stream).sent
+        • core_logging.log(DEBUG,"push",{ rc:rc.name, stream, n })
+
+cron federation_tick
+  every: "*/2 * * * *"          # a cada 2 min
+  steps:
+    - for rc in query RemoteCluster[active=true] :
+        • enqueue_task("fed.sync", { cluster_id: rc.id })
+
+engine_scheduler.run_task.register("fed.sync", (pl) -> sync_once(pl.cluster_id))

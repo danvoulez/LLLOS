@@ -1,0 +1,41 @@
+# ──────────── FLOW ────────────
+flow revoke_identity
+  inputs:
+    - id: string                     # LLID a revogar
+    - reason?: string = "manual revoke"
+    - cascade?: bool = true
+  outputs:
+    - revoked_count: int             # total de IDs afetados
+
+  steps:
+    # 1. busca alvo
+    - let subj = fetch LogLineID[value = id]
+        ? "id não encontrado"
+    - ensure subj.revoked_at == null
+        ? "id já revogado"
+
+    # 2. revoga alvo & log
+    - update LogLineID[id] { revoked_at = now() }
+    - create audit_log {
+        event: "revoke",
+        id, scope: subj.scope,
+        reason, at: now()
+      }
+
+    # 3. se em cascata, percorre filhos não revogados
+    - let count = 1
+    - if cascade {
+        • for child in query LogLineID[
+              parent_id = id,
+              revoked_at = null
+          ] :
+            – let res = revoke_identity(
+                id = child.value,
+                reason = concat("cascade from ", id),
+                cascade = true
+              )
+            – count = count + res.revoked_count
+      }
+
+    # 4. devolve total
+    - return { revoked_count: count }

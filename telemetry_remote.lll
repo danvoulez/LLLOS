@@ -1,0 +1,58 @@
+###############################################################################
+module telemetry_remote
+version: "0.1.0"
+###############################################################################
+import telemetry_core.*          # TSDB local (MetricPoint / Rollup)
+import core_logging.*
+
+const ENDPOINT = env("PROM_REMOTE_URL","")
+const USER     = env("PROM_REMOTE_USER","")
+const PASS     = env("PROM_REMOTE_PASS","")
+
+if ENDPOINT == "" {
+  core_logging.log(WARN,"PROM_REMOTE_URL not set – remote write disabled")
+}
+
+###############################################################################
+# 1 │ encode in Prometheus remote-write protobuf (snappy) – helper
+###############################################################################
+behavior encode_prom
+  inputs:{ samples:list<json> }  # [{metric:{name:”tasks_pending”,...}, ts,val}]
+  outputs:{ body:bytes }
+  steps:
+    - let pb = prom_pb_write(samples)   # builtin helper in runtime .lll
+    - return { body: snappy(pb) }
+
+###############################################################################
+# 2 │ batch & push every 30 s
+###############################################################################
+cron remote_write
+  every:"*/30 * * * * *"
+  steps:
+    - if ENDPOINT == "" { return }
+    # gather points inserted in last 35 s
+    - let since = now() - interval '35 seconds'
+    - let pts = query metricpoint[ts >= since]
+    - if size(pts)==0 { return }
+
+    # transform to Prom samples
+    - let samples = map(pts, p -> {
+        metric:{__name__:p.key}, ts:epoch_ms(p.ts), val:p.val
+      })
+    - let body = encode_prom(samples).body
+
+    - try {
+        http.post(
+          url=ENDPOINT,
+          body=body,
+          headers={
+            "Content-Encoding":"snappy",
+            "Content-Type":"application/x-protobuf"
+          },
+          basic_auth = USER != "" ? { user:USER, pass:PASS } : null,
+          timeout="5s"
+        )
+        core_logging.log(DEBUG,"Remote-write ok",{n:size(samples)})
+      } catch any e {
+        core_logging.log(ERROR,"Remote-write fail",{err:e.message})
+      }

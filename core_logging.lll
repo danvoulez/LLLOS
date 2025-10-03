@@ -1,0 +1,24 @@
+module core_logging
+version: "0.1.0"
+
+enum LogLevel { TRACE, DEBUG, INFO, WARN, ERROR }
+
+behavior log
+  inputs:
+    - level: LogLevel = INFO
+    - msg: string
+    - ctx?: json = {}
+  steps:
+    - emit event log_entry {
+        ts: now(), level, msg, ctx
+      }
+    - if env("LOG_STDOUT") == "true" {
+        • stdout(format("[%s] %s — %s", level, now_iso(), msg))
+      }
+
+flow init_logger
+  inputs:
+    - default_level?: LogLevel = INFO
+  steps:
+    - env_set("LOG_LEVEL", default_level)
+    - log(INFO, "logger initialized", { default_level })

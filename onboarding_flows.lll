@@ -1,0 +1,137 @@
+###############################################################################
+module onboarding_flows
+version: "1.0.0"
+###############################################################################
+import core_boot.*
+import core_logging.*
+import core_db.*
+import identity_auth_service.*
+import rbac.*
+import enforcement_policy.*
+import rules_engine.*
+import federation_sync.*
+import dashboards.*
+import api_gateway.*
+import system_workflows.*
+
+###############################################################################
+# 1 │ FLOW bootstrap_core
+###############################################################################
+flow bootstrap_core
+  description: "Migrations + logger + cron basico"
+  outputs:{ ok:bool }
+  steps:
+    - core_boot.start_core()
+    - core_logging.log(INFO,"core ready")
+    - return { ok:true }
+
+###############################################################################
+# 2 │ FLOW setup_rbac
+###############################################################################
+flow setup_rbac
+  inputs:{ owner_llid:string }
+  steps:
+    - create_role("ADMIN","Permissões totais")
+    - for p in ["tasks.enqueue","rules.read","events.subscribe","tokens.issue"] :
+        • if !exists permission[name=p] { create_permission(p,"auto") }
+        • if !exists rolepermission[role="ADMIN",perm=p] {
+            grant_permission("ADMIN",p)
+          }
+    - if !exists rolebinding[principal_id=owner_llid, role="ADMIN", revoked_at=null]{
+        bind_role(owner_llid,"ADMIN","*")
+      }
+    - core_logging.log(INFO,"RBAC ok", { owner:owner_llid })
+
+###############################################################################
+# 3 │ FLOW setup_quota_demo
+###############################################################################
+flow setup_quota_demo
+  inputs:{ tenant:string="demo" }
+  steps:
+    - if !exists quota_policy[tenant_id=tenant,scope="llm.calls"] {
+        insert quota_policy {
+          id:uuid_v7(), tenant_id:tenant,
+          scope:"llm.calls", limit:1000, period:"DAY"
+        }
+      }
+    - core_logging.log(INFO,"Quota demo ok",{tenant})
+
+###############################################################################
+# 4 │ FLOW setup_rules_demo
+###############################################################################
+flow setup_rules_demo
+  steps:
+    - if !exists rule[name="alert_big_tx"] {
+        insert rule {
+          id:uuid_v7(), name:"alert_big_tx",
+          expr:"amount > 10000", action:"notify.ops", enabled:true
+        }
+      }
+    - core_logging.log(INFO,"Rule demo ok")
+
+###############################################################################
+# 5 │ FLOW setup_federation_loopback
+###############################################################################
+flow setup_federation_loopback
+  inputs:{ url:string="http://localhost:8080" }
+  steps:
+    - if !exists remote_cluster[name="loopback"] {
+        insert remote_cluster {
+          id:uuid_v7(), name:"loopback", base_url:url, active:true
+        }
+      }
+    - core_logging.log(INFO,"Federation loopback ok")
+
+###############################################################################
+# 6 │ FLOW setup_selfsigned_cert
+###############################################################################
+flow setup_selfsigned_cert
+  inputs:
+    - cert_path:string="/certs/dev.pem"
+    - key_path:string="/certs/dev.key"
+  steps:
+    - if !file.exists(cert_path) {
+        file.gen_selfsigned(cert=cert_path,key=key_path,subject="CN=VoulezVous Dev")
+        core_logging.log(WARN,"self-signed cert criado",{cert_path})
+      }
+    - env_set("TLS_CERT", cert_path)
+    - env_set("TLS_KEY",  key_path)
+
+###############################################################################
+# 7 │ FLOW start_services
+###############################################################################
+flow start_services
+  steps:
+    - dashboards.start()
+    - api_gateway.start()
+    - system_workflows.bootstrap_cluster()
+    - core_logging.log(INFO,"services up")
+
+###############################################################################
+# 8 │ FLOW onboarding_all  (orquestra todos)
+###############################################################################
+flow onboarding_all
+  inputs:{ owner_llid:string }
+  steps:
+    - bootstrap_core()
+    - setup_rbac(owner_llid)
+    - setup_quota_demo()
+    - setup_rules_demo()
+    - setup_federation_loopback()
+    - setup_selfsigned_cert()
+    - start_services()
+    - core_logging.log(INFO,"✅ onboarding completo",{owner:owner_llid})
+
+###############################################################################
+# 9 │ CLI wrapper
+###############################################################################
+endpoint CLI onb
+  subcommands:[all,core,rbac,quota,rule,fed,cert]
+
+command onb all   flags:{ --me:string(required) } action:{ onboarding_all(flags.me) }
+command onb core  flags:{}                         action:{ bootstrap_core() }
+command onb rbac  flags:{ --me:string(required) }  action:{ setup_rbac(flags.me) }
+command onb quota flags:{}                         action:{ setup_quota_demo() }
+command onb rule  flags:{}                         action:{ setup_rules_demo() }
+command onb fed   flags:{}                         action:{ setup_federation_loopback() }
+command onb cert  flags:{}                         action:{ setup_selfsigned_cert() }
